@@ -1,0 +1,1783 @@
+---
+title: "DATA622 Assignment 1"
+author: "Alexander Simon"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Libraries
+# ---------
+library(pacman)
+pacman::p_load(corrplot, cowplot, gt, kableExtra, tidyverse)
+
+# Functions
+# ---------
+
+# This function returns columns in a dataframe that have missing values (NA)
+get_na_columns <- function(df) {
+  # count NAs in all columns, keeping those with NAs
+  na_columns <- map(df, ~ sum(is.na(.))) %>%
+    keep(~ .x > 0)
+  
+  if (length(na_columns) == 0) {
+    return("There are no columns with missing values")
+  }
+  return(na_columns)
+}
+
+# This function returns the number of duplicate rows in a dataframe
+count_duplicate_rows <- function(df) {
+  return (nrow(df) - nrow(distinct(df)))
+}
+
+# This function returns the proportions of all values of a factor variable in a vector
+# in descending order
+fct_proportions <- function(variable) {
+  contingency_table <- table(variable)
+  proportions <- as.data.frame(round(prop.table(contingency_table) * 100, 2)) %>%
+    arrange(desc(Freq))
+  return(proportions)
+}
+
+# This function returns the upper triangular part of a matrix
+# Elements in the lower triangular part are replaced with NA
+get_upper_triangular_df <- function(mat) {
+  mat[lower.tri(mat, diag = T)] <- NA
+  return(as.data.frame(mat))
+}
+
+# This function creates a combination boxplot-histogram
+plot_boxhist <- function(data, var, xmin, xmax, ymax, plot_title, fill_color,
+                         hist_binwidth, upper_fence_xint,
+                         arrow_coord_vec, label_coord_vec,
+                         xlab, plot_caption, plot_ratio_vec) {
+  # Variables
+  # ---------
+  #   data - dataframe containing variable of interest
+  #   var - quantitative variable (vector) in dataframe
+  #   xmin - minimum value of plot x-axis
+  #   xmax - maximum value of plot x-axis
+  #   ymax - maximum value of plot y-axis
+  #   fill_color - fill color for boxplot and histogram
+  #   plot_title - title of plot (string)
+  #   hist_binwidth - histogram bin width
+  #   upper_fence_xint - x-intercept of boxplot upper fence
+  #   arrow_coord_vec - vector of 4 coordinates of 'outlier' arrow
+  #                     (x_start, y_start, x_end, y_end)
+  #   label_coord_vec - vector of 2 xy-coordinates of 'outlier' label
+  #                     (x_start, y_start)
+  #   xlab - x-axis label (string)
+  #   plot_caption - plot footnote (string)
+  #   plot_ratio_vec - vector of relative boxplot-to-histogram heights, eg 1:4 = c(1,4)
+  #
+  # Boxplot
+  p1 <- ggplot(data, aes(x = var)) +
+    geom_boxplot(fill = fill_color) +
+    xlim(xmin, xmax) +
+    guides(x = guide_axis(minor.ticks = TRUE, cap = 'upper'),
+           y = guide_axis(cap = 'upper')) +
+    labs(title = plot_title) +
+    theme_classic() +
+    theme(
+      plot.title = element_text(size = 12, face = 'bold'),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.ticks = element_blank(),
+      axis.line = element_blank()
+    )
+
+  # Histogram
+  p2 <- ggplot(data, aes(x = var)) +
+    geom_histogram(binwidth = hist_binwidth, fill = fill_color, color = 'gray30') +
+    geom_vline(xintercept = upper_fence_xint,
+               linetype = 'dashed', color = 'gray30') +
+    annotate('segment', x = arrow_coord_vec[1], y = arrow_coord_vec[2], 
+             xend = arrow_coord_vec[3], yend = arrow_coord_vec[4],
+             arrow = arrow(ends = 'both'), color = 'gray60') +
+    annotate("text", x = label_coord_vec[1], y = label_coord_vec[2], 
+             label = 'Outliers', color = 'gray40') +
+    coord_cartesian(xlim = c(xmin, xmax), ylim = c(0, ymax)) +
+    guides(x = guide_axis(minor.ticks = TRUE, cap = 'upper'),
+           y = guide_axis(minor.ticks = TRUE, cap = 'upper')) +
+    labs(x = xlab, y = 'Count', caption = plot_caption) +
+    theme_classic() +
+    theme(
+      axis.title = element_text(face = "bold"),
+      plot.caption = element_text(color = "gray30", hjust = 0)
+    )
+
+  # Combine plots
+  cowplot::plot_grid(p1, p2, ncol = 1, rel_heights = plot_ratio_vec, 
+                     align = 'v', axis = 'lr')
+  }
+```
+
+This assignment aims to perform exploratory data analysis of [UCI bank marketing datasets](https://archive.ics.uci.edu/dataset/222/bank+marketing) and recommend suitable machine learning algorithms to predict whether a client will subscribe to a term deposit.
+
+# 0. Data input and cleaning
+
+I read the four datasets into dataframes and performed some initial checks on data types, duplicates, and missing data.
+
+## Dataset 1: bank-full
+
+```{r message=FALSE}
+url <- 'https://raw.githubusercontent.com/alexandersimon1/Data622/refs/heads/main/Assignment1/bank-full.csv'
+bank_full_df <- read_delim(url, delim = ';', show_col_types = FALSE)
+```
+
+This dataset has 45,211 rows (clients) and 17 columns (features), and the data appear to be tidy.
+
+```{r}
+glimpse(bank_full_df)
+```
+
+I used the descriptions in the [Variables Table](https://archive.ics.uci.edu/dataset/222/bank+marketing) on the source data website to rename the columns to make them more descriptive.
+
+```{r}
+bank_full_df <- bank_full_df %>%
+  select(age,
+         job_type = job, 
+         marital_status = marital, 
+         highest_education = education,
+         credit_is_defaulted = default,
+         avg_yearly_balance = balance,
+         has_housing_loan = housing,
+         has_personal_loan = loan,
+         communication_type = contact,
+         last_contact_dow = day,
+         last_contact_month = month,
+         last_contact_duration_sec = duration,
+         campaign_contacts = campaign,
+         days_since_last_contact = pdays,
+         previous_contacts = previous,
+         previous_contact_outcome = poutcome,
+         has_term_deposit = y)
+```
+
+To facilitate analysis, I also changed the categorical variables from character type to factors and yes/no variables to logical variables.
+
+```{r}
+categorical_variables <- c('job_type', 'marital_status', 'highest_education',
+                           'communication_type', 'previous_contact_outcome')
+
+bank_full_df <- bank_full_df %>%
+  mutate_at(categorical_variables, factor)
+```
+
+```{r}
+bank_full_df <- bank_full_df %>%
+  mutate(
+    credit_is_defaulted = ifelse(credit_is_defaulted == 'yes', TRUE, FALSE),
+    has_housing_loan = ifelse(has_housing_loan == 'yes', TRUE, FALSE),
+    has_personal_loan = ifelse(has_personal_loan == 'yes', TRUE, FALSE),
+    has_term_deposit = ifelse(has_term_deposit == 'yes', TRUE, FALSE)
+  )
+```
+
+Then I checked for duplicates and missing values (there were none).
+
+```{r}
+sprintf("Duplicate rows in dataset: %d", count_duplicate_rows(bank_full_df))
+```
+
+```{r}
+get_na_columns(bank_full_df)
+```
+
+## Dataset 2: bank
+
+```{r message=FALSE}
+url <- 'https://raw.githubusercontent.com/alexandersimon1/Data622/refs/heads/main/Assignment1/bank.csv'
+bank_subset_df <- read_delim(url, delim = ';', show_col_types = FALSE)
+```
+
+This dataset has 4,521 rows (clients) and 17 columns (features), and the data appear to be tidy.
+
+```{r}
+glimpse(bank_subset_df)
+```
+
+As with the `bank_full` dataset, I renamed some columns and changed some data types.
+
+```{r}
+bank_subset_df <- bank_subset_df %>%
+  select(age,
+         job_type = job, 
+         marital_status = marital, 
+         highest_education = education,
+         credit_is_defaulted = default,
+         avg_yearly_balance = balance,
+         has_housing_loan = housing,
+         has_personal_loan = loan,
+         communication_type = contact,
+         last_contact_dow = day,
+         last_contact_month = month,
+         last_contact_duration_sec = duration,
+         campaign_contacts = campaign,
+         days_since_last_contact = pdays,
+         previous_contacts = previous,
+         previous_contact_outcome = poutcome,
+         has_term_deposit = y)
+```
+
+```{r}
+bank_subset_df <- bank_subset_df %>%
+  mutate_at(categorical_variables, factor)
+```
+
+```{r}
+bank_subset_df <- bank_subset_df %>%
+  mutate(
+    credit_is_defaulted = ifelse(credit_is_defaulted == 'yes', TRUE, FALSE),
+    has_housing_loan = ifelse(has_housing_loan == 'yes', TRUE, FALSE),
+    has_personal_loan = ifelse(has_personal_loan == 'yes', TRUE, FALSE),
+    has_term_deposit = ifelse(has_term_deposit == 'yes', TRUE, FALSE)
+  )
+```
+
+There were no duplicates or missing values in this dataset.
+
+```{r}
+sprintf("Duplicate rows in dataset: %d", count_duplicate_rows(bank_subset_df))
+```
+
+```{r}
+get_na_columns(bank_subset_df)
+```
+
+## Dataset 3: bank-additional-full
+
+```{r message=FALSE}
+url <- 'https://raw.githubusercontent.com/alexandersimon1/Data622/refs/heads/main/Assignment1/bank-additional-full.csv'
+bank_additional_full_df <- read_delim(url, delim = ';', show_col_types = FALSE)
+```
+
+This dataset has 41,188 rows (clients) and 21 columns (features), and the data appear to be tidy.
+
+```{r}
+glimpse(bank_additional_full_df)
+```
+
+As with the other datasets, I made the column names more descriptive.
+
+```{r}
+bank_additional_full_df <- bank_additional_full_df %>%
+  select(age,
+         job_type = job, 
+         marital_status = marital, 
+         highest_education = education,
+         credit_is_defaulted = default,
+         has_housing_loan = housing,
+         has_personal_loan = loan,
+         communication_type = contact,
+         last_contact_dow = day_of_week,
+         last_contact_month = month,
+         last_contact_duration_sec = duration,
+         campaign_contacts = campaign,
+         days_since_last_contact = pdays,
+         previous_contacts = previous,
+         previous_contact_outcome = poutcome,
+         employee_variation_rate = emp.var.rate,
+         consumer_price_index = cons.price.idx,
+         consumer_confidence_index = cons.conf.idx,
+         euribor_rate_3m = euribor3m,
+         n_employees = nr.employed,
+         has_term_deposit = y)
+```
+
+The `bank_additional_full` dataset has 5 new variables that are not found in the `bank_full` dataset. In addition, the `bank_additional_full` dataset does not have an `avg_yearly_balance` variable.
+
+```{r}
+setdiff(colnames(bank_additional_full_df), colnames(bank_full_df))
+```
+
+```{r}
+setdiff(colnames(bank_full_df), colnames(bank_additional_full_df))
+```
+
+I also coerced categorical variables to be factors and binary (yes/no) variables to be logical.
+
+```{r}
+bank_additional_full_df <- bank_additional_full_df %>%
+  mutate_at(categorical_variables, factor)
+```
+
+```{r}
+bank_additional_full_df <- bank_additional_full_df %>%
+  mutate(
+    credit_is_defaulted = ifelse(credit_is_defaulted == 'yes', TRUE, FALSE),
+    has_housing_loan = ifelse(has_housing_loan == 'yes', TRUE, FALSE),
+    has_personal_loan = ifelse(has_personal_loan == 'yes', TRUE, FALSE),
+    has_term_deposit = ifelse(has_term_deposit == 'yes', TRUE, FALSE)
+  )
+```
+
+This dataset had 14 duplicate rows and no missing values.
+
+```{r}
+sprintf("Duplicate rows in dataset: %d", count_duplicate_rows(bank_additional_full_df))
+```
+
+```{r}
+get_na_columns(bank_additional_full_df)
+```
+
+## Dataset 4: bank-additional
+
+```{r message=FALSE}
+url <- 'https://raw.githubusercontent.com/alexandersimon1/Data622/refs/heads/main/Assignment1/bank-additional.csv'
+bank_additional_df <- read_delim(url, delim = ';', show_col_types = FALSE)
+```
+
+This dataset has 4,119 rows (clients) and 21 columns (features), and the data appear to be tidy.
+
+```{r}
+glimpse(bank_additional_df)
+```
+
+As with the `bank_additional_full` dataset, I renamed some columns and changed some data types.
+
+```{r}
+bank_additional_df <- bank_additional_df %>%
+  select(age,
+         job_type = job, 
+         marital_status = marital, 
+         highest_education = education,
+         credit_is_defaulted = default,
+         has_housing_loan = housing,
+         has_personal_loan = loan,
+         communication_type = contact,
+         last_contact_dow = day_of_week,
+         last_contact_month = month,
+         last_contact_duration_sec = duration,
+         campaign_contacts = campaign,
+         days_since_last_contact = pdays,
+         previous_contacts = previous,
+         previous_contact_outcome = poutcome,
+         employee_variation_rate = emp.var.rate,
+         consumer_price_index = cons.price.idx,
+         consumer_confidence_index = cons.conf.idx,
+         euribor_rate_3m = euribor3m,
+         n_employees = nr.employed,
+         has_term_deposit = y)
+```
+
+```{r}
+bank_additional_df <- bank_additional_df %>%
+  mutate_at(categorical_variables, factor)
+```
+
+```{r}
+bank_additional_df <- bank_additional_df %>%
+  mutate(
+    credit_is_defaulted = ifelse(credit_is_defaulted == 'yes', TRUE, FALSE),
+    has_housing_loan = ifelse(has_housing_loan == 'yes', TRUE, FALSE),
+    has_personal_loan = ifelse(has_personal_loan == 'yes', TRUE, FALSE),
+    has_term_deposit = ifelse(has_term_deposit == 'yes', TRUE, FALSE)
+  )
+```
+
+This dataset did not have any duplicate rows or missing values.
+
+```{r}
+sprintf("Duplicate rows in dataset: %d", count_duplicate_rows(bank_additional_df))
+```
+
+```{r}
+get_na_columns(bank_additional_df)
+```
+
+# 1. Exploratory data analysis
+
+Because the `bank` and `bank_additional` datasets are subsets of the full datasets, I only performed EDA on the latter.
+
+## 1.1. Logical variables
+
+### 1.1.1. Credit in default
+
+In the `bank_full` dataset, a little less than 2% of clients have credit in default.
+
+```{r}
+fct_proportions(bank_full_df$credit_is_defaulted) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+In the `bank_additional_full` dataset, the proportion is much smaller (0.01%), ie the clients have better credit than those in the other dataset.
+
+```{r}
+fct_proportions(bank_additional_full_df$credit_is_defaulted) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+### 1.1.2. Housing loan
+
+In both datasets, approximately half of the clients have a housing loan.
+
+```{r}
+fct_proportions(bank_full_df$has_housing_loan) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+fct_proportions(bank_additional_full_df$has_housing_loan) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+### 1.1.3. Personal loan
+
+In both datasets, most (\~85%) clients have a personal loan.
+
+```{r}
+fct_proportions(bank_full_df$has_personal_loan) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+fct_proportions(bank_additional_full_df$has_personal_loan) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+### 1.1.4. Term deposit
+
+In both datasets, most (\~88%) clients have a term deposit.
+
+```{r}
+fct_proportions(bank_full_df$has_term_deposit) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+fct_proportions(bank_additional_full_df$has_term_deposit) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+## 1.2. Categorical variables
+
+### 1.2.1. Job type
+
+In the `bank_full` dataset, the most common job types are blue collar (21.5%) and management (20.9%) and the least common is student (2.1%).
+
+```{r}
+fct_proportions(bank_full_df$job_type) %>%
+  kbl() %>%
+  kable_styling()  
+```
+
+```{r}
+ggplot(bank_full_df, aes(x = fct_rev(fct_infreq(job_type)))) + 
+  geom_bar(stat = 'count', fill = 'steelblue') +
+  coord_flip() +
+  labs(y = 'Count', x = 'Job Type') +
+  ggtitle('Job types in bank_full dataset') +
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+The distribution of job types in the `bank_additional_full` dataset is similar. The most common job types are admin (25.3%) and blue collar (22.5%) and the least common is student (2.1%).
+
+```{r}
+fct_proportions(bank_additional_full_df$job_type) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+ggplot(bank_additional_full_df, aes(x = fct_rev(fct_infreq(job_type)))) + 
+  geom_bar(stat = 'count', fill = '#E1BE6A') +
+  coord_flip() +
+  labs(y = 'Count', x = 'Job Type') +
+  ggtitle('Job types in bank_additional_full dataset') +  
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+### 1.2.2. Marital status
+
+In the `bank_full` dataset, most clients (60.2%) are married.
+
+```{r}
+fct_proportions(bank_full_df$marital_status) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+ggplot(bank_full_df, aes(x = fct_rev(fct_infreq(marital_status)))) + 
+  geom_bar(stat = 'count', fill = 'steelblue') +
+  ylim(0, 30000) +  
+  coord_flip() +
+  labs(y = 'Count', x = 'Marital Status') +
+  ggtitle('Marital status in bank_full dataset') +  
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+The distribution of marital status in the `bank_additional_full` dataset is similar. Most clients (60.5%) are married.
+
+```{r}
+fct_proportions(bank_additional_full_df$marital_status) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+ggplot(bank_additional_full_df, aes(x = fct_rev(fct_infreq(marital_status)))) + 
+  geom_bar(stat = 'count', fill = '#E1BE6A') +
+  ylim(0, 30000) +  
+  coord_flip() +
+  labs(y = 'Count', x = 'Marital Status') +
+  ggtitle('Marital status in bank_additional_full dataset') +  
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+### 1.2.3. Education level
+
+In the `bank_full` dataset, most (51.3%) clients completed secondary education.
+
+```{r}
+fct_proportions(bank_full_df$highest_education) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+ggplot(bank_full_df, aes(x = fct_rev(fct_infreq(highest_education)))) + 
+  geom_bar(stat = 'count', fill = 'steelblue') +
+  ylim(0, 25000) +
+  coord_flip() +
+  labs(y = 'Count', x = 'Highest Education Level') +
+  ggtitle('Education levels in bank_full dataset') +  
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+The `bank_additional_full` dataset provides more detailed information about clients' education level. Specifically, primary is broken down into basic 9y, 6y, and 4y, and there is an additional category for professional coursework.
+
+Unlike the `bank_full` dataset, the most common education level in the `bank_additional_full` dataset is university degree (29.5%), which is equivalent to tertiary education in the `bank_full` dataset.
+
+```{r}
+fct_proportions(bank_additional_full_df$highest_education) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+ggplot(bank_additional_full_df, aes(x = fct_rev(fct_infreq(highest_education)))) + 
+  geom_bar(stat = 'count', fill = '#E1BE6A') +
+  coord_flip() +
+  labs(y = 'Count', x = 'Highest Education Level') +
+  ggtitle('Education levels in bank_additional_full dataset') +  
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+### 1.2.4. Communication type
+
+In both the `bank_full` and `bank_additional_full` datasets, the majority of clients are contacted by cell phone.
+
+```{r}
+fct_proportions(bank_full_df$communication_type) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+ggplot(bank_full_df, aes(x = fct_rev(fct_infreq(communication_type)))) + 
+  geom_bar(stat = 'count', fill = 'steelblue') +
+  ylim(0, 30000) +
+  coord_flip() +
+  labs(y = 'Count', x = 'Communication Type') +
+  ggtitle('Communication types in bank_full dataset') +  
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+fct_proportions(bank_additional_full_df$communication_type) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+ggplot(bank_additional_full_df, aes(x = fct_rev(fct_infreq(communication_type)))) + 
+  geom_bar(stat = 'count', fill = '#E1BE6A') +
+  ylim(0, 30000) +
+  coord_flip() +
+  labs(y = 'Count', x = 'Communication Type') +
+  ggtitle('Communication types in bank_additional_full dataset') +  
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+### 1.2.5. Outcome of previous contacts
+
+In the `bank_full` and `bank_additional_full` datasets, the outcomes of previous contacts is mostly unknown or nonexistent (ie, no previous contact). Among known outcomes, 'failure' is more common than 'success' (\~10% vs 3% of total clients).
+
+```{r}
+fct_proportions(bank_full_df$previous_contact_outcome) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+ggplot(bank_full_df, aes(x = fct_rev(fct_infreq(previous_contact_outcome)))) + 
+  geom_bar(stat = 'count', fill = 'steelblue') +
+  ylim(0, 40000) +
+  coord_flip() +
+  labs(y = 'Count', x = 'Outcome') +
+  ggtitle('Outcomes of previous contact in bank_full dataset') +  
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+fct_proportions(bank_additional_full_df$previous_contact_outcome) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+ggplot(bank_additional_full_df, aes(x = fct_rev(fct_infreq(previous_contact_outcome)))) + 
+  geom_bar(stat = 'count', fill = '#E1BE6A') +
+  ylim(0, 40000) +
+  coord_flip() +
+  labs(y = 'Count', x = 'Outcome') +
+  ggtitle('Outcomes of previous contact in bank_additional_full dataset') +  
+  theme_bw() +
+  theme(
+    axis.title = element_text(face = "bold")
+  )
+```
+
+## 1.3. Numeric variables
+
+### 1.3.1. Age
+
+The age distribution is similar in both datasets. In the `bank_full` dataset, age ranges from 18 to 95 years and the mean (SD) age is 40.9 (10.6) years. In the `bank_additional_full` dataset, age ranges from 17 to 98 and the mean (SD) age is 40.0 (10.4) years.
+
+Histograms and boxplots show that most clients are between 25 to 60 years old, and \~1% of clients are potential outliers.
+
+`Bank_full` dataset details
+
+```{r}
+bank_full_df %>%
+  summarise(min = min(age), 
+            max = max(age),
+            mean = round(mean(age), 1),
+            sd = round(sd(age), 1),
+            median = median(age),
+            IQR = IQR(age)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+The histogram below shows that most clients In the `bank_full` dataset are between 25 to 60 years old. A boxplot shows that 487 clients (\~1% of the total dataset) older than 70.5 years are potential outliers.
+
+```{r}
+# Upper fence = Q3 + 1.5 * IQR
+upper_fence <- as.numeric(quantile(bank_full_df$age, 0.75) + 1.5 * IQR(bank_full_df$age))
+n_outliers <- sum(bank_full_df$age > upper_fence)
+sprintf('There are %d potential outliers >%.1f years old', n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_full_df, var = bank_full_df$age, 
+             xmin = 0, xmax = 100, ymax = 2250, 
+             plot_title = 'Distribution of age in bank_full dataset (N=45,211)*\n',
+             fill_color = 'steelblue',
+             hist_binwidth = 1, upper_fence_xint = 70.5,
+             arrow_coord_vec = c(71, 2250, 97, 2250), 
+             label_coord_vec = c(84, 2100),
+             xlab = 'Age (years)', 
+             plot_caption = '',
+             plot_ratio_vec = c(1,4))
+```
+
+`Bank_additional_full` dataset details
+
+```{r}
+bank_additional_full_df %>%
+  summarise(min = min(age), 
+            max = max(age),
+            mean = round(mean(age), 1),
+            sd = round(sd(age), 1),
+            median = median(age),
+            IQR = IQR(age)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+The histogram below shows that most clients In the `bank_additional_full` dataset are between 25 to 60 years old. A boxplot shows that 469 clients (\~1% of the total dataset) older than 69.5 years are potential outliers.
+
+```{r}
+upper_fence <- as.numeric(quantile(bank_additional_full_df$age, 0.75) + 
+                            1.5 * IQR(bank_additional_full_df$age))
+n_outliers <- sum(bank_additional_full_df$age > upper_fence)
+sprintf('There are %d potential outliers >%.1f years old', n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_additional_full_df, var = bank_additional_full_df$age, 
+             xmin = 0, xmax = 100, ymax = 2250, 
+             plot_title = 'Distribution of age in bank_additional_full dataset (N=41,188)*\n',
+             fill_color = '#E1BE6A',
+             hist_binwidth = 1, upper_fence_xint = 69.5,
+             arrow_coord_vec = c(71, 2250, 100, 2250), 
+             label_coord_vec = c(86, 2100),
+             xlab = 'Age (years)', 
+             plot_caption = '',
+             plot_ratio_vec = c(1,4))
+```
+
+### 1.3.2. Average yearly balance
+
+In the `bank_full` dataset, the average yearly balance ranges from -8019 to 102127 (currency unknown). The mean (SD) balance is 1362.3 (3044.8), and the median (IQR) is 448 (1356). A boxplot shows that \~1% of clients have average yearly balances that are potential outliers.
+
+This variable does not exist in the `bank_additional_full` dataset.
+
+```{r}
+bank_full_df %>%
+  summarise(min = min(avg_yearly_balance), 
+            max = max(avg_yearly_balance),
+            mean = round(mean(avg_yearly_balance), 1),
+            sd = round(sd(avg_yearly_balance), 1),
+            median = median(avg_yearly_balance),
+            IQR = IQR(avg_yearly_balance)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+The histogram below shows that the distribution of balances In the `bank_full` dataset is strongly right skewed. A boxplot shows that 4729 clients (\~10% of the total dataset) who have average yearly balances greater than 3462 or less than -1962 are potential outliers.
+
+```{r}
+upper_fence <- as.numeric(quantile(bank_full_df$avg_yearly_balance, 0.75) + 
+                            1.5 * IQR(bank_full_df$avg_yearly_balance))
+n_outliers <- sum(bank_full_df$avg_yearly_balance > upper_fence)
+sprintf('There are %d potential outliers with average yearly balance >%.0f', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+# Lower fence = Q1 - 1.5 * IQR
+lower_fence <- as.numeric(quantile(bank_full_df$avg_yearly_balance, 0.25) - 
+                            1.5 * IQR(bank_full_df$avg_yearly_balance))
+n_outliers <- sum(bank_full_df$avg_yearly_balance < lower_fence)
+sprintf('There are %d potential outliers with average yearly balance <%.0f', 
+        n_outliers, lower_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_full_df, var = bank_full_df$avg_yearly_balance,
+             xmin = -10000, xmax = 120000, ymax = 25000,
+             plot_title = paste0('Distribution of average yearly balance ',
+                                 'in bank_full dataset (N=45,211)\n'),
+             fill_color = 'steelblue',
+             hist_binwidth = 1000, upper_fence_xint = 3462,
+             arrow_coord_vec = c(3500, 20000, 100000, 20000),
+             label_coord_vec = c(55000, 18000),
+             xlab = 'Average yearly balance',
+             plot_caption = '',
+             plot_ratio_vec = c(1,4))
+```
+
+### 1.3.3. Last contact duration
+
+The distribution of last contact duration is similar in both datasets and have the same range (0 to 4918 seconds). In the `bank_full` dataset, the mean (SD) duration was 258.2 (257.5) seconds and the median (IQR) was 180 (216) seconds. In the `bank_additional_full` dataset, the mean (SD) duration was 258.3 (259.3) seconds and the median (IQR) was 180 (217) seconds.
+
+Boxplots show that the duration of last contact for \~7% of clients are potential outliers.
+
+`Bank_full` dataset details
+
+```{r}
+bank_full_df %>%
+  summarise(min = min(last_contact_duration_sec), 
+            max = max(last_contact_duration_sec),
+            mean = round(mean(last_contact_duration_sec), 1),
+            sd = round(sd(last_contact_duration_sec), 1),
+            median = median(last_contact_duration_sec),
+            IQR = IQR(last_contact_duration_sec)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+The histogram below shows that the last contact duration In the `bank_full` dataset was right skewed. A boxplot shows that 3235 clients (\~7% of the total dataset) with duration greater than 643 seconds are potential outliers.
+
+```{r}
+# Upper fence = Q3 + 1.5 * IQR
+upper_fence <- as.numeric(quantile(bank_full_df$last_contact_duration_sec, 0.75) + 
+                            1.5 * IQR(bank_full_df$last_contact_duration_sec))
+n_outliers <- sum(bank_full_df$last_contact_duration_sec > upper_fence)
+sprintf('There are %d potential outliers with duration >%.0f seconds', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_full_df, var = bank_full_df$last_contact_duration_sec,
+             xmin = 0, xmax = 5000, ymax = 10000,
+             plot_title = paste0('Distribution of last contact duration ',
+                                 'in bank_full dataset (N=45,211)\n'),
+             fill_color = 'steelblue',
+             hist_binwidth = 60, upper_fence_xint = 643,
+             arrow_coord_vec = c(650, 7500, 5000, 7500),
+             label_coord_vec = c(2900, 7000),
+             xlab = 'Duration of last contact (seconds)',
+             plot_caption = '',
+             plot_ratio_vec = c(1,4))
+```
+
+`Bank_additional_full` dataset details
+
+```{r}
+bank_additional_full_df %>%
+  summarise(min = min(last_contact_duration_sec), 
+            max = max(last_contact_duration_sec),
+            mean = round(mean(last_contact_duration_sec), 1),
+            sd = round(sd(last_contact_duration_sec), 1),
+            median = median(last_contact_duration_sec),
+            IQR = IQR(last_contact_duration_sec)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+The histogram below shows that the last contact duration In the `bank_additional_full` dataset was right skewed. A boxplot shows that 2963 clients (\~7% of the total dataset) with duration greater than 644 seconds are potential outliers.
+
+```{r}
+# Upper fence = Q3 + 1.5 * IQR
+upper_fence <- as.numeric(quantile(bank_additional_full_df$last_contact_duration_sec, 0.75) + 
+                            1.5 * IQR(bank_additional_full_df$last_contact_duration_sec))
+n_outliers <- sum(bank_additional_full_df$last_contact_duration_sec > upper_fence)
+sprintf('There are %d potential outliers with duration >%.0f seconds', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_additional_full_df, 
+             var = bank_additional_full_df$last_contact_duration_sec,
+             xmin = 0, xmax = 5000, ymax = 10000,
+             plot_title = paste0('Distribution of last contact duration ',
+                                 'in bank_additional_full dataset (N=41,188)\n'),
+             fill_color = '#E1BE6A',
+             hist_binwidth = 60, upper_fence_xint = 644,
+             arrow_coord_vec = c(650, 7500, 5000, 7500),
+             label_coord_vec = c(2900, 7000),
+             xlab = 'Duration of last contact (seconds)',
+             plot_caption = '',
+             plot_ratio_vec = c(1,4))
+```
+
+### 1.3.4. Number of contacts during this campaign
+
+The distribution of the number of campaign contacts is similar in both datasets. In the `bank_full` dataset, the number of contacts ranged from 1 to 63, and the mean (SD) was 2.8 (3.1). In the `bank_additional_full` dataset, the number of contacts ranged from 1 to 56, and the mean (SD) was 2.6 (2.8).
+
+Histograms and boxplots show that most clients have fewer than 6 contacts, and the number of contacts for \~7% of clients are potential outliers.
+
+`Bank_full` dataset details
+
+```{r}
+bank_full_df %>%
+  summarise(min = min(campaign_contacts), 
+            max = max(campaign_contacts),
+            mean = round(mean(campaign_contacts), 1),
+            sd = round(sd(campaign_contacts), 1),
+            median = median(campaign_contacts),
+            IQR = IQR(campaign_contacts)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+The histogram below shows that most clients In the `bank_full` dataset have fewer than 6 contacts. A boxplot shows that 3064 clients (\~7% of the total dataset) with more than 6 contacts are potential outliers.
+
+```{r}
+# Upper fence = Q3 + 1.5 * IQR
+upper_fence <- as.numeric(quantile(bank_full_df$campaign_contacts, 0.75) + 
+                            1.5 * IQR(bank_full_df$campaign_contacts))
+n_outliers <- sum(bank_full_df$campaign_contacts > upper_fence)
+sprintf('There are %d potential outliers with >%.0f contacts', n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_full_df, var = bank_full_df$campaign_contacts,
+             xmin = 0, xmax = 70, ymax = 20000,
+             plot_title = paste0('Distribution of number of campaign contacts ',
+                                 'in bank_full dataset (N=45,211)\n'),
+             fill_color = 'steelblue',
+             hist_binwidth = 1, upper_fence_xint = 6,
+             arrow_coord_vec = c(6, 15000, 65, 15000),
+             label_coord_vec = c(37, 14000),
+             xlab = 'Number of campaign contacts',
+             plot_caption = '',
+             plot_ratio_vec = c(1,4))
+```
+
+`Bank_additional_full` dataset details
+
+```{r}
+bank_additional_full_df %>%
+  summarise(min = min(campaign_contacts), 
+            max = max(campaign_contacts),
+            mean = round(mean(campaign_contacts), 1),
+            sd = round(sd(campaign_contacts), 1),
+            median = median(campaign_contacts),
+            IQR = IQR(campaign_contacts)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+The histogram below shows that most clients In the `bank_additional_full` dataset have fewer than 6 contacts. A boxplot shows that 2406 clients (\~7% of the total dataset) with more than 6 contacts are potential outliers.
+
+```{r}
+# Upper fence = Q3 + 1.5 * IQR
+upper_fence <- as.numeric(quantile(bank_additional_full_df$campaign_contacts, 0.75) + 
+                            1.5 * IQR(bank_additional_full_df$campaign_contacts))
+n_outliers <- sum(bank_additional_full_df$campaign_contacts > upper_fence)
+sprintf('There are %d potential outliers with >%.0f contacts', n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_additional_full_df, 
+             var = bank_additional_full_df$campaign_contacts,
+             xmin = 0, xmax = 70, ymax = 20000,
+             plot_title = paste0('Distribution of number of campaign contacts in\n',
+                                 'bank_additional_full dataset (N=41,188)\n'),
+             fill_color = '#E1BE6A',
+             hist_binwidth = 1, upper_fence_xint = 6,
+             arrow_coord_vec = c(6, 15000, 56, 15000),
+             label_coord_vec = c(30, 14000),
+             xlab = 'Number of campaign contacts',
+             plot_caption = '',
+             plot_ratio_vec = c(1,3))
+```
+
+### 1.3.5. Days since last contact
+
+The majority of clients (\>80%) in the two datasets have not been contacted previously. Among clients with previous contact, the distribution of the number of days since last contact differs between datasets.
+
+In the `bank_full` dataset, among clients with previous contact, the number of days since last contact ranged from 0 to 871, and the mean (SD) number of days was 224.6 (115.3). Histogram and boxplot analysis showed that in this subset, most clients have been contacted during the past year.
+
+In the `bank_additional_full` dataset, among clients with previous contact, the spread and variance in the number of days since last contact was less than that in the `bank_full` dataset (range: 0-27 days, mean [SD]: 6 [3.8]). Similarly, histogram and boxplot analysis showed that most clients were previously contacted within 1-2 weeks. This suggests that the `bank_additional_full` dataset includes clients who are more responsive to outreach.
+
+`Bank_full` dataset details
+
+```{r}
+bank_full_previous_contact_df <- bank_full_df %>%
+  # -1 is used as a placeholder for clients who have no previous contact
+  filter(days_since_last_contact >= 0)
+  
+no_previous_contact <- nrow(bank_full_df) - nrow(bank_full_previous_contact_df)
+total_clients <- nrow(bank_full_df)
+sprintf('%.0f (%.1f%%) clients do not have any previous contact', 
+        no_previous_contact, (no_previous_contact / total_clients)*100)
+```
+
+```{r}
+bank_full_previous_contact_df %>%
+  summarise(min = min(days_since_last_contact), 
+            max = max(days_since_last_contact),
+            mean = round(mean(days_since_last_contact), 1),
+            sd = round(sd(days_since_last_contact), 1),
+            median = median(days_since_last_contact),
+            IQR = IQR(days_since_last_contact)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+A histogram of the subset of clients In the `bank_full` dataset who have been previously contacted shows that most were last contacted within the past year. A boxplot shows that 49 clients (\~3% of this subset) who were last contacted \>618 days ago are potential outliers.
+
+```{r}
+# Upper fence = Q3 + 1.5 * IQR
+upper_fence <- as.numeric(
+  quantile(bank_full_previous_contact_df$days_since_last_contact, 0.75) + 
+  1.5 * IQR(bank_full_previous_contact_df$days_since_last_contact))
+n_outliers <- sum(bank_full_previous_contact_df$days_since_last_contact > upper_fence)
+sprintf('There are %d potential outliers with >%.0f days since last contact', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+# Boxplot
+p1 <- ggplot(bank_full_previous_contact_df, aes(x = days_since_last_contact)) +
+  geom_boxplot(fill = 'steelblue') +
+  xlim(0, 1000) +
+  guides(x = guide_axis(minor.ticks = TRUE, cap = 'upper'),
+         y = guide_axis(cap = 'upper')) +
+  labs(title = paste0('Distribution of number of days since last contact ',
+                      'in bank_full dataset (N=8257)*\n')) +
+  theme_classic() +
+theme(
+  plot.title = element_text(size = 12, face = 'bold'),
+  axis.title = element_blank(),
+  axis.text = element_blank(),
+  axis.ticks = element_blank(),
+  axis.line = element_blank()
+)
+
+# Histogram
+p2 <- ggplot(bank_full_previous_contact_df, aes(x = days_since_last_contact)) +
+  geom_histogram(binwidth = 10, fill = 'steelblue', color = 'gray30') +
+  geom_vline(xintercept = 618,
+             linetype = 'dashed', color = 'gray30') +
+  # Label outliers
+  annotate('segment', x = 620, y = 600, xend = 870, yend = 600,
+           arrow = arrow(ends = 'both'), color = 'gray60') +
+  annotate("text", x = 750, y = 550, label = 'Outliers', color = 'gray40') +
+  # Label peaks
+  annotate('segment', x = 35, y = 700, xend = 80, yend = 650,
+           arrow = arrow(length = unit(2, 'mm'), ends = 'last'), color = 'steelblue') +
+  annotate("text", x = 45, y = 725, label = '91 days', color = 'steelblue') +  
+  annotate('segment', x = 200, y = 700, xend = 250, yend = 750,
+           arrow = arrow(length = unit(2, 'mm'), ends = 'first'), color = 'steelblue') +
+  annotate("text", x = 310, y = 760, label = '182 days', color = 'steelblue') +
+  annotate('segment', x = 375, y = 425, xend = 425, yend = 475,
+           arrow = arrow(length = unit(2, 'mm'), ends = 'first'), color = 'steelblue') +
+  annotate("text", x = 450, y = 510, label = '370 days', color = 'steelblue') +  
+  coord_cartesian(xlim = c(0, 1000), ylim = c(0, 800)) +
+  guides(x = guide_axis(minor.ticks = TRUE, cap = 'upper'),
+         y = guide_axis(minor.ticks = TRUE, cap = 'upper')) +
+  labs(x = 'Number of days since last contact', y = 'Count',
+       caption = '\n*Excluding 36,954 clients who have no previous contact.') +
+  theme_classic() +
+  theme(
+    axis.title = element_text(face = "bold"),
+    plot.caption = element_text(color = "gray30", hjust = 0)    
+  )
+
+# Combine plots
+cowplot::plot_grid(p1, p2, ncol = 1, rel_heights = c(1, 4), align = 'v', axis = 'lr')
+```
+
+The highest peaks in the histogram above occur at approximately 91, 182, and 370 days since the last contact, which suggests that most client outreach is performed on a quarterly or semiannual basis.
+
+```{r}
+as.data.frame(table(bank_full_previous_contact_df$days_since_last_contact)) %>%
+  filter(Freq >= 90) %>%
+  arrange(desc(Freq))
+```
+
+`Bank_additional_full` dataset details
+
+```{r}
+bank_addl_full_previous_contact_df <- bank_additional_full_df %>%
+  # 999 is used as a placeholder for clients who have no previous contact
+  filter(days_since_last_contact != 999)
+  
+no_previous_contact <- nrow(bank_additional_full_df) - 
+  nrow(bank_addl_full_previous_contact_df)
+total_clients <- nrow(bank_additional_full_df)
+sprintf('%.0f (%.1f%%) clients do not have any previous contact', 
+        no_previous_contact, (no_previous_contact / total_clients)*100)
+```
+
+```{r}
+bank_addl_full_previous_contact_df %>%
+  summarise(min = min(days_since_last_contact), 
+            max = max(days_since_last_contact),
+            mean = round(mean(days_since_last_contact), 1),
+            sd = round(sd(days_since_last_contact), 1),
+            median = median(days_since_last_contact),
+            IQR = IQR(days_since_last_contact)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+A histogram of the subset of clients In the `bank_additional_full` dataset who have been previously contacted shows that most were last contacted within the past two weeks, with most outreach occurring on days 3 and 6. A boxplot shows that 82 clients (\~5% of this subset) with \>13 days since last contact are potential outliers.
+
+```{r}
+# Upper fence = Q3 + 1.5 * IQR
+upper_fence <- as.numeric(
+  quantile(bank_addl_full_previous_contact_df$days_since_last_contact, 0.75) + 
+  1.5 * IQR(bank_addl_full_previous_contact_df$days_since_last_contact))
+n_outliers <- sum(bank_addl_full_previous_contact_df$days_since_last_contact > upper_fence)
+sprintf('There are %d potential outliers with >%.0f days since last contact', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_addl_full_previous_contact_df, 
+             var = bank_addl_full_previous_contact_df$days_since_last_contact,
+             xmin = 0, xmax = 30, ymax = 500,
+             plot_title = paste0('Distribution of number of days since last contact in\n',
+                                 'bank_additional_full dataset (N=1515)*\n'),
+             fill_color = '#E1BE6A',
+             hist_binwidth = 1, upper_fence_xint = 13,
+             arrow_coord_vec = c(13, 400, 27, 400),
+             label_coord_vec = c(20, 375),
+             xlab = 'Number of days since last contact',
+             plot_caption = '\n*Excluding 39,673 clients who have no previous contact.',
+             plot_ratio_vec = c(1,3))
+```
+
+### 1.3.6. Number of contacts during previous campaigns
+
+The majority of clients (\>80%) in the two datasets did not have any contacts in previous campaigns. Among clients with contacts, the distribution of the number of contacts differs between datasets.
+
+In the `bank_full` dataset, among clients with previous contact, the number of contacts during previous campaigns ranged from 1 to 275, and the mean (SD) number of contacts was 3.2 (4.6). Histogram and boxplot analysis showed that in this subset, most clients had less than 8 contacts in previous campaigns, and that the client with 275 contacts was an extreme outlier.
+
+In the `bank_additional_full` dataset, among clients with contacts during previous campaigns, the spread and variance in the number of contacts was less than that in the `bank_full` dataset (range: 1-7 contacts, mean [SD]: 1.3 [0.6]). Similarly, histogram and boxplot analysis showed that most clients had 1 contact.
+
+`Bank_full` dataset details
+
+```{r}
+bank_full_previous_contact_df <- bank_full_df %>%
+  filter(previous_contacts > 0)
+  
+no_previous_contact <- nrow(bank_full_df) - nrow(bank_full_previous_contact_df)
+total_clients <- nrow(bank_full_df)
+sprintf('%.0f (%.1f%%) clients do not have any contacts during previous campaigns', 
+        no_previous_contact, (no_previous_contact / total_clients)*100)
+```
+
+```{r}
+bank_full_previous_contact_df %>%
+  summarise(min = min(previous_contacts), 
+            max = max(previous_contacts),
+            mean = round(mean(previous_contacts), 1),
+            sd = round(sd(previous_contacts), 1),
+            median = median(previous_contacts),
+            IQR = IQR(previous_contacts)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+Among clients In the `bank_full` dataset who had contacts during previous campaigns, the number of contacts was strongly right skewed. A boxplot showed that 453 clients (\~5% of this subset) who had \>8 contacts are potential outliers, and that the client with 275 contacts is an extreme outlier.
+
+```{r}
+# Upper fence = Q3 + 1.5 * IQR
+upper_fence <- as.numeric(quantile(bank_full_previous_contact_df$previous_contacts, 0.75) + 
+                            1.5 * IQR(bank_full_previous_contact_df$previous_contacts))
+n_outliers <- sum(bank_full_previous_contact_df$previous_contacts > upper_fence)
+sprintf('There are %d potential outliers with >%.0f contacts', n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_full_previous_contact_df, 
+             var = bank_full_previous_contact_df$previous_contacts,
+             xmin = 0, xmax = 300, ymax = 4000,
+             plot_title = paste0('Distribution of number of contacts during ',
+                                 'previous campaigns in\n',
+                                 'bank_full dataset (N=8257)*\n'),
+             fill_color = 'steelblue',
+             hist_binwidth = 3, upper_fence_xint = 8,
+             arrow_coord_vec = c(9, 3000, 300, 3000),
+             label_coord_vec = c(150, 2800),
+             xlab = 'Number of contacts during previous campaigns',
+             plot_caption = paste0('\n*Excluding 36,954 clients who had no contacts ',
+                                   'during previous campaigns.'),
+             plot_ratio_vec = c(1,3))
+```
+
+`Bank_additional_full` dataset details
+
+```{r}
+bank_addl_full_previous_contact_df <- bank_additional_full_df %>%
+  filter(previous_contacts > 0)
+  
+no_previous_contact <- nrow(bank_additional_full_df) - 
+  nrow(bank_addl_full_previous_contact_df)
+total_clients <- nrow(bank_additional_full_df)
+sprintf('%.0f (%.1f%%) clients do not have any contacts during previous campaigns', 
+        no_previous_contact, (no_previous_contact / total_clients)*100)
+```
+
+```{r}
+bank_addl_full_previous_contact_df %>%
+  summarise(min = min(previous_contacts), 
+            max = max(previous_contacts),
+            mean = round(mean(previous_contacts), 1),
+            sd = round(sd(previous_contacts), 1),
+            median = median(previous_contacts),
+            IQR = IQR(previous_contacts)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+Among clients In the `bank_additional_full` dataset who had contacts during previous campaigns, most had 1 contact. A boxplot showed that 1064 clients (\~19% of this subset) with \>1 contact are potential outliers.
+
+```{r}
+# Upper fence = Q3 + 1.5 * IQR
+upper_fence <- as.numeric(
+  quantile(bank_addl_full_previous_contact_df$previous_contacts, 0.75) + 
+  1.5 * IQR(bank_addl_full_previous_contact_df$previous_contacts))
+n_outliers <- sum(bank_addl_full_previous_contact_df$previous_contacts > upper_fence)
+sprintf('There are %d potential outliers with >%.0f contacts', n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_addl_full_previous_contact_df, 
+             var = bank_addl_full_previous_contact_df$previous_contacts,
+             xmin = 0, xmax = 8, ymax = 5000,
+             plot_title = paste0('Distribution of number of contacts during ',
+                                 'previous campaigns in\n',
+                                 'bank_additional_full dataset (N=5625)*\n'),
+             fill_color = '#E1BE6A',
+             hist_binwidth = 1, upper_fence_xint = 1,
+             arrow_coord_vec = c(2, 4000, 7, 4000),
+             label_coord_vec = c(4, 3800),
+             xlab = 'Number of contacts during previous campaigns',
+             plot_caption = paste0('\n*Excluding 35,563 clients who had no contacts ',
+                                   'during previous campaigns.'),
+             plot_ratio_vec = c(1,3))
+```
+
+### 1.3.7. Employee variation rate
+
+This variable does not exist in the `bank_full` dataset.
+
+In the `bank_additional_full` dataset, employee variation rate ranges from -3.4 to 1.4, and the median (IQR) is 1.1 (3.2). Although the variable is numeric, there are only 10 different values, the most frequent (39.4%) of which is 1.4 and the least frequent (0.02%) is -0.2.
+
+A boxplot indicates that there are no potential outliers.
+
+```{r}
+bank_additional_full_df %>%
+  summarise(min = min(employee_variation_rate), 
+            max = max(employee_variation_rate),
+            mean = round(mean(employee_variation_rate), 1),
+            sd = round(sd(employee_variation_rate), 1),
+            median = median(employee_variation_rate),
+            IQR = IQR(employee_variation_rate)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+fct_proportions(bank_additional_full_df$employee_variation_rate) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+upper_fence <- as.numeric(quantile(bank_additional_full_df$employee_variation_rate, 0.75) + 
+                            1.5 * IQR(bank_additional_full_df$employee_variation_rate))
+n_outliers <- sum(bank_additional_full_df$employee_variation_rate > upper_fence)
+sprintf('There are %d potential outliers with rate >%.1f', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+# Boxplot
+ggplot(bank_additional_full_df, aes(x = employee_variation_rate)) +
+  geom_boxplot(fill = '#E1BE6A') +
+  xlim(-5, 5) +
+  guides(x = guide_axis(minor.ticks = TRUE, cap = 'upper'),
+         y = guide_axis(cap = 'upper')) +
+  labs(title = paste0('Distribution of employee variation rate in ',
+                      'bank_additional_full dataset (N=41,188)\n'),
+       x = 'Employee variation rate') +
+  theme_classic() +
+theme(
+  plot.title = element_text(size = 12, face = 'bold'),
+  axis.title = element_text(face = 'bold')
+)
+```
+
+### 1.3.8. Consumer price index
+
+This variable does not exist in the `bank_full` dataset.
+
+In the `bank_additional_full` dataset, consumer price index ranges from 92.201 to 94.767, and the mean (SD) is 93.576 (0.579). A boxplot indicates that there are no potential outliers.
+
+```{r}
+bank_additional_full_df %>%
+  summarise(min = min(consumer_price_index), 
+            max = max(consumer_price_index),
+            mean = round(mean(consumer_price_index), 3),
+            sd = round(sd(consumer_price_index), 3),
+            median = median(consumer_price_index),
+            IQR = IQR(consumer_price_index)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+upper_fence <- as.numeric(quantile(bank_additional_full_df$consumer_price_index, 0.75) + 
+                            1.5 * IQR(bank_additional_full_df$consumer_price_index))
+n_outliers <- sum(bank_additional_full_df$consumer_price_index > upper_fence)
+sprintf('There are %d potential outliers with consumer price index >%.3f', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_additional_full_df, 
+             var = bank_additional_full_df$consumer_price_index,
+             xmin = 92, xmax = 95, ymax = 8000,
+             plot_title = paste0('Distribution of consumer price index in\n',
+                                 'bank_additional_full dataset (N=41,188)'),
+             fill_color = '#E1BE6A',
+             hist_binwidth = 0.1, upper_fence_xint = 95.373,
+             arrow_coord_vec = c(-1, -1, -1, -1),  # no arrow for outliers
+             label_coord_vec = c(-1, -1),  # no label for outliers
+             xlab = 'Consumer price index',
+             plot_caption = '',
+             plot_ratio_vec = c(1,4))
+```
+
+### 1.3.9. Consumer confidence index
+
+This variable does not exist in the `bank_full` dataset.
+
+In the `bank_additional_full` dataset, consumer confidence index ranges from -50.8 to -26.9, and the mean (SD) is -40.5 (4.6). A boxplot indicates that 447 values (\~1% of the dataset) equal to the maximum are potential outliers.
+
+```{r}
+bank_additional_full_df %>%
+  summarise(min = min(consumer_confidence_index), 
+            max = max(consumer_confidence_index),
+            mean = round(mean(consumer_confidence_index), 1),
+            sd = round(sd(consumer_confidence_index), 1),
+            median = median(consumer_confidence_index),
+            IQR = IQR(consumer_confidence_index)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+The histogram below shows that the distribution of consumer confidence index In the `bank_additional_full` dataset is dominated by a few frequent values. A boxplot indicates that 447 values (\~1% of the dataset) that are greater than -26.9 are potential outliers.
+
+```{r}
+upper_fence <- as.numeric(quantile(bank_additional_full_df$consumer_confidence_index, 0.75) + 
+                            1.5 * IQR(bank_additional_full_df$consumer_confidence_index))
+n_outliers <- sum(bank_additional_full_df$consumer_confidence_index > upper_fence)
+sprintf('There are %d potential outliers with consumer confidence index >%.1f', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_additional_full_df, 
+             var = bank_additional_full_df$consumer_confidence_index,
+             xmin = -55, xmax = -20, ymax = 15000,
+             plot_title = paste0('Distribution of consumer confidence index in\n',
+                                 'bank_additional_full dataset (N=41,188)'),
+             fill_color = '#E1BE6A',
+             hist_binwidth = 1, upper_fence_xint = -26.9,
+             arrow_coord_vec = c(-26.9, 10000, -26.9, 10000),
+             label_coord_vec = c(-24, 10000),
+             xlab = 'Consumer confidence index',
+             plot_caption = '',
+             plot_ratio_vec = c(1,3))
+```
+
+### 1.3.10. 3-month Euro interbank offered rate (eurobor_rate_3m)
+
+This variable does not exist in the `bank_full` dataset.
+
+In the `bank_additional_full` dataset, 3-month Euribor rates range from 0.634% to 5.045%. The mean (SD) is 3.6% (1.7%). There are no potential outliers.
+
+```{r}
+bank_additional_full_df %>%
+  summarise(min = min(euribor_rate_3m), 
+            max = max(euribor_rate_3m),
+            mean = round(mean(euribor_rate_3m), 1),
+            sd = round(sd(euribor_rate_3m), 1),
+            median = median(euribor_rate_3m),
+            IQR = IQR(euribor_rate_3m)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+The histogram below shows that 3-month Euribor rates In the `bank_additional_full` dataset have three large clusters (\~0.6% to 1.5%, 4.0% to 4.2%, and 4.9% to 5.0%). The predominance of higher rates (\~5%) suggest that interest rates for personal loans and other credit products are also higher in this dataset.
+
+A boxplot indicates that there are no potential outliers.
+
+```{r}
+upper_fence <- as.numeric(quantile(bank_additional_full_df$euribor_rate_3m, 0.75) + 
+                            1.5 * IQR(bank_additional_full_df$euribor_rate_3m))
+n_outliers <- sum(bank_additional_full_df$euribor_rate_3m > upper_fence)
+sprintf('There are %d potential outliers with values >%.1f%%', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+plot_boxhist(data = bank_additional_full_df, 
+             var = bank_additional_full_df$euribor_rate_3m,
+             xmin = 0, xmax = 6, ymax = 15000,
+             plot_title = paste0('Distribution of eurobor3m rates in\n',
+                                 'bank_additional_full dataset (N=41,188)'),
+             fill_color = '#E1BE6A',
+             hist_binwidth = 0.1, upper_fence_xint = 10.4,
+             arrow_coord_vec = c(-1, -1, -1, -1),  # no arrow for outliers
+             label_coord_vec = c(-1, -1),  # no label for outliers
+             xlab = '3-month Eurobor rate (%)',
+             plot_caption = '',
+             plot_ratio_vec = c(1,3))
+```
+
+### 1.3.11. Number of employees
+
+This variable does not exist in the `bank_full` dataset.
+
+In the `bank_additional_full` dataset, the number of employees range from -4963.6 to 5228.1, and the median (IQR) is 5191 (129) employees. Although the variable is numeric, there are only 11 different values, the most frequent (39.4%) of which is 5228.1 and the least frequent (0.02%) is 5176.
+
+It is not clear why some values for this variable. are not integers In practice, the source data for this variable should be verified and corrected as needed. In the absence of verification, values could be rounded to the nearest integer.
+
+There are no potential outliers.
+
+```{r}
+bank_additional_full_df %>%
+  summarise(min = min(n_employees), 
+            max = max(n_employees),
+            mean = round(mean(n_employees), 1),
+            sd = round(sd(n_employees), 1),
+            median = median(n_employees),
+            IQR = IQR(n_employees)) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+fct_proportions(bank_additional_full_df$n_employees) %>%
+  kbl() %>%
+  kable_styling()
+```
+
+```{r}
+upper_fence <- as.numeric(quantile(bank_additional_full_df$n_employees, 0.75) + 
+                            1.5 * IQR(bank_additional_full_df$n_employees))
+n_outliers <- sum(bank_additional_full_df$n_employees > upper_fence)
+sprintf('There are %d potential outliers with >%.1f employees', 
+        n_outliers, upper_fence)
+```
+
+```{r}
+# Boxplot
+ggplot(bank_additional_full_df, aes(x = n_employees)) +
+  geom_boxplot(fill = '#E1BE6A') +
+  xlim(4800, 5500) +
+  guides(x = guide_axis(minor.ticks = TRUE, cap = 'upper'),
+         y = guide_axis(cap = 'upper')) +
+  labs(title = paste0('Distribution of number of employees in ',
+               'bank_additional_full dataset (N=41,188)\n'),
+       x = 'Number of employees') +
+  theme_classic() +
+theme(
+  plot.title = element_text(size = 12, face = 'bold'),
+  axis.title = element_text(face = 'bold')
+)
+```
+
+## 1.4. Correlation analysis
+
+### 1.4.1. Categorical variables
+
+In both datasets, Chi-square tests revealed statistically significant associations among categorical variables. Of note, the target variable `has_term_deposit` is significantly associated with `job_type`, `marital_status`, `highest_education`, `communication_type`, and `previous_contact_outcome` (yellow row), which suggests that these features have predictive power for the target variable. However, these features are also significantly associated with each other (red P values), which may indicate redundant information.
+
+`Bank_full` dataset
+
+```{r warning=FALSE}
+# Calculate Chi-square p-values for all pairwise tests of categorical variables
+# Adapted from https://stackoverflow.com/questions/72968705/chi-squared-test-of-independence-across-all-variables
+bank_catvar_df <- bank_full_df %>%
+  select(credit_is_defaulted, has_housing_loan, has_personal_loan, has_term_deposit,
+         job_type, marital_status, highest_education, communication_type,
+         previous_contact_outcome)
+
+pairwise_chisq <- formatC(outer(bank_catvar_df, bank_catvar_df, 
+      Vectorize(\(x, y) chisq.test(table(x, y))$p.value)), format = 'e', digits = 1)
+```
+
+```{r}
+get_upper_triangular_df(pairwise_chisq) %>%
+  gt(rownames_to_stub = TRUE) %>%
+  # Title
+  tab_header(
+    title = md('Chi-square test p-values for all pairwise combinations of categorical variables')
+  ) %>%
+  opt_align_table_header(align = "left") %>%  
+  # Highlight cells of interest
+  tab_style(
+    style = cell_fill(color = 'wheat'),
+    locations = cells_body(
+      columns = c(job_type, marital_status, highest_education, communication_type,
+                  previous_contact_outcome),
+      rows = 4  # has_term_deposit
+    )
+  ) %>%
+  tab_style(
+    style = cell_fill(color = 'wheat'),
+    locations = cells_stub(rows = 4)
+  ) %>%  
+  tab_style(
+    style = cell_text(color = 'darkred'),
+    locations = cells_body(
+      columns = c(marital_status, highest_education, communication_type,
+                  previous_contact_outcome),
+      rows = 5  # job_type
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = 'darkred'),
+    locations = cells_body(
+      columns = c(highest_education, communication_type,
+                  previous_contact_outcome),
+      rows = 6  # marital_status
+    )
+  ) %>% 
+  tab_style(
+    style = cell_text(color = 'darkred'),
+    locations = cells_body(
+      columns = c(communication_type,
+                  previous_contact_outcome),
+      rows = 7  # highest_education
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = 'darkred'),
+    locations = cells_body(
+      columns = c(previous_contact_outcome),
+      rows = 8  # communication_type
+    )
+  ) %>%   
+  # boldface column labels
+  tab_style(
+    style = "font-weight: bold",
+    locations = cells_column_labels()
+  ) %>%
+  # boldface row labels
+  tab_style(
+    style = "font-weight: bold",
+    locations = cells_stub(rows = everything())  
+  )
+```
+
+<br>
+
+`Bank_additional_full` dataset
+
+```{r warning=FALSE}
+bank_catvar_df2 <- bank_additional_full_df %>%
+  select(credit_is_defaulted, has_housing_loan, has_personal_loan, has_term_deposit,
+         job_type, marital_status, highest_education, communication_type,
+         previous_contact_outcome)
+
+pairwise_chisq <- formatC(outer(bank_catvar_df2, bank_catvar_df2, 
+      Vectorize(\(x, y) chisq.test(table(x, y))$p.value)), format = 'e', digits = 1)
+```
+
+```{r}
+get_upper_triangular_df(pairwise_chisq) %>%
+  gt(rownames_to_stub = TRUE) %>%
+  # Title
+  tab_header(
+    title = md('Chi-square test p-values for all pairwise combinations of categorical variables')
+  ) %>%
+  opt_align_table_header(align = "left") %>%
+  # Highlight cells of interest
+  tab_style(
+    style = cell_fill(color = 'wheat'),
+    locations = cells_body(
+      columns = c(job_type, marital_status, highest_education, communication_type,
+                  previous_contact_outcome),
+      rows = 4  # has_term_deposit
+    )
+  ) %>%
+  tab_style(
+    style = cell_fill(color = 'wheat'),
+    locations = cells_stub(rows = 4)
+  ) %>%   
+  tab_style(
+    style = cell_text(color = 'darkred'),
+    locations = cells_body(
+      columns = c(marital_status, highest_education, communication_type,
+                  previous_contact_outcome),
+      rows = 5  # job_type
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = 'darkred'),
+    locations = cells_body(
+      columns = c(highest_education, communication_type,
+                  previous_contact_outcome),
+      rows = 6  # marital_status
+    )
+  ) %>% 
+  tab_style(
+    style = cell_text(color = 'darkred'),
+    locations = cells_body(
+      columns = c(communication_type,
+                  previous_contact_outcome),
+      rows = 7  # highest_education
+    )
+  ) %>%
+  tab_style(
+    style = cell_text(color = 'darkred'),
+    locations = cells_body(
+      columns = c(previous_contact_outcome),
+      rows = 8  # communication_type
+    )
+  ) %>%   
+  # boldface column labels
+  tab_style(
+    style = "font-weight: bold",
+    locations = cells_column_labels()
+  ) %>%
+  # boldface row labels
+  tab_style(
+    style = "font-weight: bold",
+    locations = cells_stub(rows = everything())  
+  )
+```
+
+<br>
+
+### 1.4.2. Numeric variables
+
+`Bank_full` dataset
+
+There is a moderate positive correlation (r=0.45) between the number of contacts during previous campaigns (`previous_contacts`) and the number of days since the last contact (`days_since_last_contact`).
+
+No other numeric variables are strongly correlated.
+
+```{r}
+bank_full_numeric_df <- bank_full_df %>%
+  select(age, avg_yearly_balance, last_contact_duration_sec, campaign_contacts,
+         days_since_last_contact, previous_contacts)
+
+cor_mat <- cor(bank_full_numeric_df)
+corrplot(cor_mat, type = 'upper', diag = FALSE, tl.col = 'black', tl.srt = 45)
+```
+
+```{r}
+get_upper_triangular_df(cor_mat) %>%
+  gt(rownames_to_stub = TRUE) %>%
+  # Highlight cell of interest
+  tab_style(
+    style = cell_fill(color = 'wheat'),
+    locations = cells_body(
+      columns = previous_contacts,
+      rows = previous_contacts > 0.4
+    )
+  ) %>%
+  # boldface column labels
+  tab_style(
+    style = "font-weight: bold",
+    locations = cells_column_labels()
+  ) %>%
+  # boldface row labels
+  tab_style(
+    style = "font-weight: bold",
+    locations = cells_stub(rows = everything())  
+  )
+```
+
+<br>
+
+`Bank_additional_full` dataset
+
+Several variables in this dataset have moderate to strong correlations.
+
+The 3-month Euribor rate is nearly perfectly linearly correlated with employee variation rate (r=0.97) and number of employees (r=0.95). The employee variation rate is also strongly correlated with number of employees (r=0.91). In addition, the consumer price index has strong positive correlations with employee variation rate (r=0.78) and the 3-month Euribor rate (r=0.69).
+
+Similar to the `bank_full` dataset, the number of previous contacts is moderately correlated with the number of days since last contact; however, the correlation is negative in the `bank_additional_full` dataset (r=-0.59).
+
+The number of previous contacts is also moderately negatively correlated with the number of employees (r=-0.50), 3-month Euribor rate (r=-0.45), and employee variation rate (r=-0.42).
+
+```{r}
+bank_additional_full_numeric_df <- bank_additional_full_df %>%
+  select(age, last_contact_duration_sec, campaign_contacts, days_since_last_contact,
+         previous_contacts, employee_variation_rate, consumer_price_index, consumer_confidence_index,
+         euribor_rate_3m, n_employees)
+
+cor_mat <- cor(bank_additional_full_numeric_df)
+corrplot(cor_mat, type = 'upper', diag = FALSE, tl.col = 'black', tl.srt = 45)
+```
+
+```{r}
+get_upper_triangular_df(cor_mat) %>%
+  gt(rownames_to_stub = TRUE) %>%
+  # Highlight cells of interest
+  tab_style(
+    style = cell_fill(color = 'wheat'),
+    locations = cells_body(
+      columns = euribor_rate_3m,
+      rows = euribor_rate_3m > 0.9
+    )
+  ) %>%
+  tab_style(
+    style = cell_fill(color = 'wheat'),
+    locations = cells_body(
+      columns = n_employees,
+      rows = n_employees > 0.9
+    )
+  ) %>%
+  # Boldface column labels
+  tab_style(
+    style = "font-weight: bold",
+    locations = cells_column_labels()
+  ) %>%
+  # Boldface row labels
+  tab_style(
+    style = "font-weight: bold",
+    locations = cells_stub(rows = everything())
+  )
+```
+
+<br>
+
+# 2. Algorithm selection
+
+Determination of whether a client will subscribe to a term deposit (labeled yes/no) is a supervised binary classification problem. Of the classification algorithms that have been presented so far, I propose using logistic regression and decision trees. These algorithms are simple, efficient, scalable, and explainable, which are important considerations for business applications. In contrast to logistic regression, decision trees are generally robust to outliers, which are present in most numeric variables in the bank marketing datasets. So, if only one algorithm could be chosen, I would select decision trees; however, it may be worth comparing the performance of both classifiers because logistic regression uses a linear decision boundary and decision trees use a nonlinear decision boundary (ie, one may be better than the other for the problem).
+
+The main disadvantage of logistic regression and decision trees is that they may suffer from dimensionality problems in the full datasets with 40,000+ observations (clients) $\times$ \~20 features. In this case, dimensionality reduction (eg, principal component analysis [PCA]) could be performed before classification. Alternatively, the smaller datasets that have 10% of the observations in the full datasets could be used.
+
+# 3. Pre-processing
+
+As shown in section [0. Data input and cleaning] and also stated on the [source data website](https://archive.ics.uci.edu/dataset/222/bank+marketing), these datasets do not have missing data. However, the `bank_additional_full` dataset has some duplicate rows that need to be removed. In addition, one variable (`n_employees`) had non-integer values that do not make sense. These data should be verified and corrected as needed before model development. In the absence of verification, values could be rounded to the nearest integer.
+
+Pre-processing that is needed include:
+
+-   Regularization is needed to reduce overfitting with both logistic regression and decision trees.
+
+-   For the full datasets, which have 40,000-45,000 observations (clients), both algorithms may also benefit from dimensionality reduction (eg, PCA).
+
+-   For logistic regression, categorical variables would need to be encoded numerically (eg, by one-hot encoding). Feature scaling is not necessary, but it may improve performance.
+
+-   The target feature (`has_term_deposit`) is imbalanced in both the `bank_full` and `bank_additional_full` datasets (approximately 88% of clients do not have a term deposit; section [1.1.4. Term deposit]). Because of this, techniques such as undersampling the majority class would help reduce class imbalance.
+
+-   Feature engineering may also be helpful; however, I don't have experience in banking (or related fields), so I'm not sure how or what features could be combined to create new features.
+
+# 4. Summary of findings and implications
+
+Exploratory data analysis of the `bank_full` and `bank_additional_full` datasets showed that there are similarities and differences in the number, distribution, and type of variables as well as correlated variables. Of note:
+
+-   The `bank_additional_full` dataset has 5 numeric variables that are not found in the `bank_full` dataset, including economic indicators, such as consumer price index and Eurobor interest rates. In contrast, only the `bank_full` dataset includes clients' average yearly balance.
+
+-   Compared with the `bank_full` dataset, the `bank_additional_full` dataset has a much smaller proportion of clients whose credit is in default, a higher proportion of clients who have a university degree, and much fewer days since last contact (ie, more responsive to outreach). These differences suggest that two different predictive models and/or marketing approaches may be needed.
+
+-   In both datasets, the target variable `has_term_deposit` is significantly associated with 5 categorical variables (`job_type`, `marital_status`, `highest_education`, `communication_type`, and `previous_contact_outcome`), which suggests they may have predictive power. However, these variables are also significantly associated with each other, which suggests that they may be redundant. It is unclear which will have a greater effect on classification performance.
+
+-   All numeric variables in the `bank_full` dataset have potential outliers. The corresponding variables in the `bank_additional_full` dataset also have potential outliers. Among the numeric variables that are unique to the latter, only `consumer_confidence_index` has outliers. Ideally, the classification algorithm will need to be robust to outliers.
+
+-   The `bank_additional_full` dataset has more correlated numeric variables than the `bank_full` dataset, mainly among the economic indicator variables (which are not found in the `bank_full` dataset). Highly correlated variables, especially 3-month Euribor rate + employee variation rate or number of employees, which have Pearson r \> 0.95, would be redundant in linear classification models and could be simplified.
+
+Prediction of whether a client will subscribe to a term deposit (labeled yes/no) is a supervised binary classification problem. Of the classification algorithms that have been presented so far, I would choose decision trees, primarily because they are robust to outliers and result in an explainable model. Logistic regression may also be a possibility. Supporting techniques such as dimensionality reduction using PCA, undersampling the majority class (clients who do not have a term deposit), and boosting (for decision trees) may help improve performance.
