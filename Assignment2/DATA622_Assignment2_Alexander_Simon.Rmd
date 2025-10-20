@@ -1,0 +1,1079 @@
+---
+title: "DATA622 Assignment 2"
+author: "Alexander Simon"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Libraries
+# ---------
+library(adabag)  # AdaBoost. Version 5.1.
+library(gt)  # Format tables. Version 1.1.0
+library(caret)  # Machine learning package. Version 7.0-1
+library(Matrix)  # Matrix functions (used for one-hot encoding). Version 1.7-3
+library(PRROC)  # Calculates AUPRC. Version 1.4
+library(randomForest)  # Random forest. Version 4.7-1.2
+library(rattle)  # Supporting package to plot decision trees. Version 5.5.1
+library(rpart)  # Decision trees. Version 4.1.24
+library(rpart.plot)  # Plots rpart decision trees. Version 3.1.3
+library(smotefamily)  # Implements SMOTE algorithm. Version 1.4.0
+library(tidyverse)  # Version 2.0.0
+
+# Functions
+# ---------
+# fct_proportions() returns the proportions of all values of a factor variable in a vector
+# in descending order
+fct_proportions <- function(variable) {
+  contingency_table <- table(variable)
+  proportions <- as.data.frame(round(prop.table(contingency_table) * 100, 2)) %>%
+    arrange(desc(Freq))
+  return(proportions)
+}
+
+# performance_metrics() returns a list with recall and F1 score given a confusion matrix
+# It assumes that actual classes are rows and predicted classes are columns
+performance_metrics <- function(confusion_matrix) {
+  true_negatives <- confusion_matrix[1, 1]  
+  true_positives <- confusion_matrix[2, 2]
+  false_negatives <- confusion_matrix[1, 2]
+  false_positives <- confusion_matrix[2, 1]
+  
+  accuracy <- (true_positives + true_negatives) / 
+              (true_positives + true_negatives + false_positives + false_negatives)
+  recall <- true_positives / (true_positives + false_negatives)
+  precision <- true_positives / (true_positives + false_positives)
+  
+  return(list(accuracy, recall, precision))
+}
+
+# calc_ci95() returns a list of the lower and upper bounds of the
+# 95% confidence interval for a variable given its mean, SD, and n
+calc_ci95 <- function(mean, sd, n) {
+  upper_bound = mean + 1.96 * (sd / sqrt(n))
+  lower_bound = mean - 1.96 * (sd / sqrt(n))
+  return(list(lower_bound, upper_bound))
+}
+
+# Randomization seed
+set.seed(1024)
+```
+
+This assignment aims to perform machine learning experiments using [UCI bank marketing datasets](https://archive.ics.uci.edu/dataset/222/bank+marketing) to identify the optimal algorithm and hyperparameters to predict whether a client will subscribe to a term deposit. Exploratory data analysis was performed previously (see [Assignment 1](https://rpubs.com/alexandersimon1/data622_assignment1)).
+
+# 0. Data input and cleaning
+
+For this assignment, I focus on the `bank_additional_full` dataset.
+
+```{r message=FALSE}
+url <- 'https://raw.githubusercontent.com/alexandersimon1/Data622/refs/heads/main/Assignment1/bank-additional-full.csv'
+bank_additional_full_df <- read_delim(url, delim = ';', show_col_types = FALSE)
+```
+
+```{r}
+# Rename columns to make them more descriptive
+bank_additional_full_df <- bank_additional_full_df %>%
+  select(age,
+         job_type = job, 
+         marital_status = marital, 
+         highest_education = education,
+         credit_is_defaulted = default,
+         has_housing_loan = housing,
+         has_personal_loan = loan,
+         communication_type = contact,
+         last_contact_dow = day_of_week,
+         last_contact_month = month,
+         last_contact_duration_sec = duration,
+         campaign_contacts = campaign,
+         days_since_last_contact = pdays,
+         previous_contacts = previous,
+         previous_contact_outcome = poutcome,
+         employee_variation_rate = emp.var.rate,
+         consumer_price_index = cons.price.idx,
+         consumer_confidence_index = cons.conf.idx,
+         euribor_rate_3m = euribor3m,
+         n_employees = nr.employed,
+         has_term_deposit = y)
+
+# Coerce categorical variables to factors
+categorical_variables <- c('job_type', 'marital_status', 'highest_education',
+                           'communication_type', 'previous_contact_outcome',
+                           'last_contact_dow', 'last_contact_month',
+                           'credit_is_defaulted', 'has_housing_loan',
+                           'has_personal_loan', 'has_term_deposit')
+
+bank_additional_full_df <- bank_additional_full_df %>%
+mutate_at(categorical_variables, factor)
+```
+
+# 1. Pre-processing
+
+## 1.1. Remove duplicates
+
+In Assignment 1, I showed that the `bank_additional_full` dataset had duplicate rows. Here, I remove them.
+
+```{r}
+bank_additional_full_df <- bank_additional_full_df %>%
+  distinct()
+```
+
+## 1.2. Data manipulation
+
+### 1.2.1. Highly correlated variables
+
+In Assignment 1, I showed that the 3-month Euribor rate is nearly perfectly linearly correlated with employee variation rate (r=0.97) and number of employees (r=0.95), and the latter two variables are also strongly correlated with each other (r=0.91). Because of this redundancy, I dropped these two variables from the dataset.
+
+Incidentally, removal of number of employees also circumvents a separate issue with the variable having some non-integer values.
+
+```{r}
+bank_additional_full_df2 <- bank_additional_full_df %>%
+  select(-c(employee_variation_rate, n_employees))
+```
+
+### 1.2.2. Target leakage
+
+To avoid target leakage, I also excluded last contact duration from the dataset.
+
+```{r}
+bank_additional_full_df2 <- bank_additional_full_df2 %>%
+  select(-c(last_contact_duration_sec))
+```
+
+### 1.2.3. Days since last contact
+
+A placeholder value is used for an unknown number of days since last contact. I wasn't sure how if any data handling was needed for this; however, it didn't make sense to delete the data since other valuable client data would be omitted from the model, so I left the values as is.
+
+# 2. Performance evaluation
+
+## 2.1. Datasets
+
+### 2.1.1. Class imbalance
+
+In Assignment 1, I showed that the target feature (`has_term_deposit`) is imbalanced (approximately 88% of clients do not have a term deposit). To reduce this class imbalance in the training dataset, I used Synthetic Minority Oversampling Technique (SMOTE). However, because SMOTE does not handle categorical variables, I first one-hot encoded these variables.
+
+```{r}
+# One-hot encode all variables except target variable (has_term_deposit)
+bank_additional_full_dgCMatrix <- sparse.model.matrix(~ . -has_term_deposit,
+                                           data = bank_additional_full_df2)
+
+# Remove first column of sparse matrix, which is artifact of conversion
+bank_additional_full_dgCMatrix <- bank_additional_full_dgCMatrix[ , -1]
+
+# Convert sparse matrix to dataframe
+bank_additional_full_df3 <- as.data.frame(as.matrix(bank_additional_full_dgCMatrix))
+
+# Rename variables to syntactically valid names to avoid issues with subsequent functions
+colnames(bank_additional_full_df3) <- make.names(names(bank_additional_full_df3))
+
+# Replace target variable and encode as numeric values
+bank_additional_full_df3 <-
+  cbind(bank_additional_full_df3,
+        has_term_deposit = bank_additional_full_df2$has_term_deposit) %>%
+  mutate(
+    has_term_deposit = ifelse(has_term_deposit == 'yes', 1, 0)
+  )
+```
+
+Then I created training and test datasets using a 70:30 split. I use the `caret::createDataParition()` function, which uses stratified random sampling to minimize the possibility that the minority class is omitted from a dataset.[^1]
+
+[^1]: Lantz B. (2023) *Machine Learning with R*, 4th ed., page 420.
+
+```{r}
+train_idx <- createDataPartition(bank_additional_full_df3$has_term_deposit, p = 0.7, list = FALSE)
+train_imbalanced <- bank_additional_full_df3[train_idx, ]
+test <- bank_additional_full_df3[-train_idx, ]
+```
+
+Finally, I applied SMOTE to the imbalanced training dataset.
+
+```{r}
+# I used the default value of K=5 for the number of nearest neighbors during sampling
+train_smote <- SMOTE(train_imbalanced[, -train_imbalanced$has_term_deposit],
+                     train_imbalanced$has_term_deposit)
+train_smote <- train_smote$data  # extract the balanced dataset
+
+# Revert target variable to categorical values and
+# remove 'class' variable (artifact of SMOTE function)
+train_smote <- train_smote %>%
+  mutate(
+    has_term_deposit = ifelse(has_term_deposit == 1, 'yes', 'no')
+  ) %>%
+  select(-c(class))
+train_smote$has_term_deposit <- as.factor(train_smote$has_term_deposit)
+```
+
+The classes of `has_term_deposit` in the SMOTE training dataset are now approximately balanced (52.2% no, 47.8% yes).
+
+```{r}
+fct_proportions(train_smote$has_term_deposit)
+```
+
+### 2.1.2. Cross-validation folds
+
+To enable statistical comparison of model performance with cross-validation, I created 10 folds from the balanced training dataset.
+
+```{r}
+folds <- createFolds(train_smote$has_term_deposit, k = 10)
+```
+
+These folds, which currently only contain row numbers of the training dataframe that comprise each fold, will be used during model development (section [3. Experiments]).
+
+## 2.2. Performance metrics
+
+For the classification problem (ie, whether a client will subscribe to a term deposit), a positive prediction means that the bank should commit marketing resources to the client, and a negative prediction means that no action is needed. False positives (ie, marketing to clients who will not subscribe) wastes time and money and reduces the return on investment (ROI) of a marketing campaign. On the other hand, false negatives (ie, failure to market to clients who would have subscribed) are missed opportunities to profit from term deposits.
+
+No data are available in the assignment to quantitatively assess whether false positives or false negatives are more costly; however, for clients with large/long term deposits, false negatives would be expected to be more costly. This suggests that recall is a key metric for this classification problem. More specifically, the best model is one that maximizes recall to minimize false negatives.
+
+For completeness, I also evaluate accuracy, precision, and model training time. The threshold for statistical significance was $\alpha = 0.05$.
+
+## 2.3. Model selection
+
+Where possible, I will calculate the mean, standard deviation, and 95% confidence interval of each performance metric using 10-fold cross-validation. Comparison of these statistics will help determine whether there is statistically significant difference in performance between models and which model is the best for predicting term deposit subscriptions.
+
+# 3. Experiments
+
+## 3.1. Decision trees
+
+### 3.1.0. Experiment DT0
+
+**Objective**: Establish baseline performance for a decision tree model of bank term deposits
+
+**Variation**: None (ie, use all features, no pruning, and no cross-validation)
+
+**Evaluation metrics**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `rpart()`
+
+Parameters:
+
+-   Decision tree control: complexity parameter `cp` = 0 to prevent pruning (ie, grow the full tree)
+
+```{r}
+# Train the model
+# Reference: https://cran.r-project.org/web/packages/rpart/vignettes/longintro.pdf
+
+dt0_runtime <- system.time(
+  dt0_model <- rpart(has_term_deposit ~ ., data = train_smote, method = 'class',
+                     control = rpart.control(cp = 0))
+)
+dt0_runtime <- dt0_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', dt0_runtime)
+```
+
+This is a large tree with 98 levels and 913 splits. Due to this complexity, I did not plot the tree.
+
+```{r}
+dt0_levels <- nrow(dt0_model$cptable)
+dt0_splits <- dt0_model[['cptable']][dt0_levels, 'nsplit']
+sprintf('Decision tree 1 has %d levels and %d splits', dt0_levels, dt0_splits)
+```
+
+The variable importance plot shows that the three most important variables in the model are economic indicators, namely, `euribor_rate_3m`, `consumer_price_index`, and `consumer_confidence_index`. These are followed by contact details (eg, `previous_contacts`, `communication_type` = telephone). The least important variables are month of last contact and variables with unknowns.
+
+```{r}
+# Extract variable importance from decision tree model
+# Rpart uses Gini index to split nodes
+# Reference: https://cran.r-project.org/web/packages/rpart/vignettes/longintro.pdf
+#
+dt0_vars_df <- as.data.frame(dt0_model$variable.importance)
+colnames(dt0_vars_df) <- c('Gini_index')
+
+# Calculate scaled scores (easier to interpret)
+total_scores <- sum(dt0_vars_df$Gini_index)
+dt0_vars_df <- dt0_vars_df %>%
+  mutate(
+    scaled_score = round(100 * (Gini_index / total_scores), 2)
+  )
+
+# Visualize the relative importance
+ggplot(dt0_vars_df, aes(x = reorder(row.names(dt0_vars_df), scaled_score), y = scaled_score)) +
+  geom_bar(stat = 'identity', fill = 'steelblue') + 
+  coord_flip() +
+  labs(x = 'Variable', y = 'Importance (scaled Gini index)',
+       title = 'Variable Importance in Full Decision Tree') +
+  theme_classic() +
+  theme(
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+Use the model to make class predictions
+
+```{r}
+dt0_predictions <- predict(dt0_model, newdata = test, type = 'class')
+```
+
+Confusion matrix
+
+```{r}
+(dt0_confusion_matrix <- table(Actual = test$has_term_deposit, Predicted = dt0_predictions))
+```
+
+The accuracy, recall, and precision of the model are shown below.
+
+```{r}
+dt0_performance <- unlist(performance_metrics(dt0_confusion_matrix))
+dt0_accuracy <- dt0_performance[1]
+dt0_recall <- dt0_performance[2]
+dt0_precision <- dt0_performance[3]
+sprintf('Accuracy: %.3f, Recall: %.3f, Precision: %.3f', dt0_accuracy, dt0_recall, dt0_precision)
+```
+
+**Conclusion**: The baseline decision tree model has moderately high accuracy but low recall and precision. However, these metrics may not be reliable estimates of its performance since cross-validation was not performed. In addition, the size and complexity of the decision tree make it unwieldy to explain and visualize.
+
+**Document results**:
+
+```{r}
+experiment_tracker_df <- data.frame(
+  model = 'Decision tree',
+  variation = 'No pruning, no CV',
+  runtime_sec = round(dt0_runtime, 1),
+  accuracy_95CI = round(dt0_accuracy, 3),  
+  recall_95CI = round(dt0_recall, 3), 
+  precision_95CI = round(dt0_precision, 3),
+  notes = 'Baseline. Fast. Large tree.'
+)
+```
+
+### 3.1.1. Experiment DT1
+
+**Objective**: Compare baseline performance for a decision tree model using cross-validation
+
+**Variation**: 10-fold cross-validation
+
+**Evaluation metrics**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `rpart()`
+
+Parameters:
+
+-   Decision tree control: complexity parameter `cp` = 0 to prevent pruning (ie, grow the full tree)
+
+```{r}
+dt1_runtime <- system.time(
+  experiment1_results <- lapply(folds, function(x) {
+    # Training and test datasets
+    exp_train <- train_smote[-x, ]
+    exp_test <- train_smote[x, ]
+    # Use training data to create decision tree classification model
+    exp_model <- rpart(has_term_deposit ~ ., data = exp_train, method = 'class',
+                       control = rpart.control(cp = 0))
+    # Make predictions on test data
+    exp_predictions <- predict(exp_model, newdata = exp_test, type = 'class')
+    # Actual (true) data for comparison
+    exp_actual <- exp_test$has_term_deposit
+    # Create confusion matrix of actual vs predicted classes
+    exp_confusion_matrix <- table(exp_actual, exp_predictions)
+    # Calculate performance metrics from confusion matrix
+    exp_performance <- unlist(performance_metrics(exp_confusion_matrix))
+    exp_accuracy <-  exp_performance[1]
+    exp_recall <- exp_performance[2]
+    exp_precision <- exp_performance[3]
+    return(list(exp_accuracy, exp_recall, exp_precision))
+  }))
+
+dt1_runtime <- dt1_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', dt1_runtime)
+```
+
+```{r}
+# Convert results (list of lists) to dataframe
+experiment1_results_df <- as.data.frame(t(data.frame(lapply(experiment1_results, unlist))))
+colnames(experiment1_results_df) <- c('Accuracy', 'Recall', 'Precision')
+experiment1_results_df
+```
+
+The 95% confidence interval for accuracy, recall, and precision is shown below. Recall, in particular, is high (\~90%).
+
+```{r}
+# Accuracy
+dt1_accuracy_CI <- unlist(calc_ci95(mean(experiment1_results_df$Accuracy), 
+                                      sd(experiment1_results_df$Accuracy), 
+                                      nrow(experiment1_results_df)))
+sprintf('Accuracy 95%% CI: (%.3f, %.3f)', dt1_accuracy_CI[1], dt1_accuracy_CI[2])
+
+# Recall
+dt1_recall_CI <- unlist(calc_ci95(mean(experiment1_results_df$Recall), 
+                                      sd(experiment1_results_df$Recall), 
+                                      nrow(experiment1_results_df)))
+sprintf('Recall 95%% CI: (%.3f, %.3f)', dt1_recall_CI[1], dt1_recall_CI[2])
+
+# Precision
+dt1_precision_CI <- unlist(calc_ci95(mean(experiment1_results_df$Precision), 
+                                      sd(experiment1_results_df$Precision), 
+                                      nrow(experiment1_results_df)))
+sprintf('Precision 95%% CI: (%.3f, %.3f)', dt1_precision_CI[1], dt1_precision_CI[2])
+```
+
+**Conclusion**: Using cross-validation shows that the baseline (unpruned) decision tree performs well (accuracy \~89%) and has balanced recall and precision (\~90% and \~86%, respectively).
+
+**Document results**:
+
+```{r}
+experiment1_documentation <- c('Decision tree', '10-fold CV', 
+                               runtime_sec = round(dt1_runtime, 1),
+                               accuracy_95CI = paste0('(', round(dt1_accuracy_CI[1], 3), ', ', 
+                                                           round(dt1_accuracy_CI[2], 3), ')'),  
+                               recall_95CI = paste0('(', round(dt1_recall_CI[1], 3), ', ', 
+                                                         round(dt1_recall_CI[2], 3), ')'),  
+                               precision_95CI = paste0('(', round(dt1_precision_CI[1], 3), ', ', 
+                                                            round(dt1_precision_CI[2], 3), ')'), 
+                               'Good performance, high recall.')
+experiment_tracker_df <- rbind(experiment_tracker_df, experiment1_documentation)
+```
+
+### 3.1.2. Experiment DT2
+
+**Objective**: Determine whether a simpler decision tree model increases recall by $\ge 5\%$.
+
+**Variation**: Reduced tree complexity (ie, tree breadth and depth), implemented via `cp` parameter
+
+-   This is expected to increase bias in the model but reduce variance[^2]
+
+[^2]: [https://medium.com/\@tkadeethum/the-bias-variance-trade-off-explained-insights-for-ml-interviews-d944bdc05f87](https://medium.com/@tkadeethum/the-bias-variance-trade-off-explained-insights-for-ml-interviews-d944bdc05f87){.uri}
+
+**Evaluation metrics**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `rpart()`
+
+Parameters:
+
+-   Decision tree control: optimized complexity parameter (explained below)
+
+I determined the optimal tree complexity by plotting the relative error versus the complexity parameter (CP) of the full decision tree. The plot shows that the first split provides the greatest information gain (ie, reduction in relative error). In addition, very little information is gained as $CP < 0.0066$ (ie, there are very small decreases for `relative_error` \< 0.5).
+
+```{r}
+dt0_cp_df <- as.data.frame(dt0_model$cptable) %>%
+  rename(relative_error = `rel error`)
+
+ggplot(filter(dt0_cp_df, CP > 0), aes(x = CP, y = relative_error)) +
+  geom_point() +
+  geom_hline(yintercept = 0.5, linetype = 'dashed', color = 'steelblue') +
+  annotate('segment', x = 0.4, y = 0.99, xend = 0.04, yend = 0.6,
+           arrow = arrow(ends = 'last'), color = 'steelblue') + 
+  annotate('text', x = 0.25, y = 0.75, label = 'First split', color = 'steelblue') +  
+  xlim(0, 0.5) + ylim(0, 1) +
+  guides(x = guide_axis(cap = "both"), y = guide_axis(cap = "both")) +
+  labs(x = 'Complexity parameter (CP)', y = 'Relative error') +
+  theme_classic() +
+  theme(
+    axis.title = element_text(face = 'bold')
+  )
+```
+
+```{r}
+# Minimum value of complexity parameter for which relative_error > 0.5
+(cp_optimal <- dt0_cp_df[which.min(dt0_cp_df$relative_error > 0.5) - 1, 'CP'])
+```
+
+I used this threshold for `cp` to generate the pruned decision tree.
+
+```{r}
+dt2_model <- rpart(has_term_deposit ~ ., data = train_smote, method = 'class',
+                   control = rpart.control(cp = cp_optimal))
+```
+
+The resulting tree is much smaller than the full tree ([3.1.1. Experiment DT1]) and has 6 levels and 5 splits.
+
+```{r}
+dt2_levels <- nrow(dt2_model$cptable)
+dt2_splits <- dt2_model[['cptable']][dt2_levels, 'nsplit']
+sprintf('Decision tree 1 has %d levels and %d splits', dt2_levels, dt2_splits)
+```
+
+The decision tree looks like this:
+
+```{r}
+fancyRpartPlot(dt2_model, main = 'Decision Tree 2', sub = '')
+```
+
+10-fold cross-validation
+
+```{r}
+dt2_runtime <- system.time(
+  experiment2_results <- lapply(folds, function(x) {
+    # Training and test datasets
+    exp_train <- train_smote[-x, ]
+    exp_test <- train_smote[x, ]
+    # Use training data to create decision tree classification model
+    exp_model <- rpart(has_term_deposit ~ ., data = exp_train, method = 'class',
+                       control = rpart.control(cp = cp_optimal))  # pruned tree
+    # Make predictions on test data
+    exp_predictions <- predict(exp_model, newdata = exp_test, type = 'class')
+    # Actual (true) data for comparison
+    exp_actual <- exp_test$has_term_deposit
+    # Create confusion matrix of actual vs predicted classes
+    exp_confusion_matrix <- table(exp_actual, exp_predictions)
+    # Calculate performance metrics from confusion matrix
+    exp_performance <- unlist(performance_metrics(exp_confusion_matrix))  
+    exp_accuracy <-  exp_performance[1]
+    exp_recall <- exp_performance[2]
+    exp_precision <- exp_performance[3]
+    return(list(exp_accuracy, exp_recall, exp_precision))
+}))
+
+dt2_runtime <- dt2_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', dt2_runtime)
+```
+
+```{r}
+# Convert results list of lists to dataframe
+experiment2_results_df <- as.data.frame(t(data.frame(lapply(experiment2_results, unlist))))
+colnames(experiment2_results_df) <- c('Accuracy', 'Recall', 'Precision')
+experiment2_results_df
+```
+
+The 95% confidence interval for accuracy, recall, and precision is shown below. Recall, in particular, decreased to \~82%.
+
+```{r}
+# Accuracy
+dt2_accuracy_CI <- unlist(calc_ci95(mean(experiment2_results_df$Accuracy), 
+                                      sd(experiment2_results_df$Accuracy), 
+                                      nrow(experiment2_results_df)))
+sprintf('Accuracy 95%% CI: (%.3f, %.3f)', dt2_accuracy_CI[1], dt2_accuracy_CI[2])
+
+# Recall
+dt2_recall_CI <- unlist(calc_ci95(mean(experiment2_results_df$Recall), 
+                                      sd(experiment2_results_df$Recall), 
+                                      nrow(experiment2_results_df)))
+sprintf('Recall 95%% CI: (%.3f, %.3f)', dt2_recall_CI[1], dt2_recall_CI[2])
+
+# Precision
+dt2_precision_CI <- unlist(calc_ci95(mean(experiment2_results_df$Precision), 
+                                      sd(experiment2_results_df$Precision), 
+                                      nrow(experiment2_results_df)))
+sprintf('Precision 95%% CI: (%.3f, %.3f)', dt2_precision_CI[1], dt2_precision_CI[2])
+```
+
+**Conclusion**: The objective was not met. All performance metrics of the pruned decision tree model were less than those of the full decision tree. Furthermore, since the confidence intervals do not overlap with those from [3.1.1. Experiment DT1], we can conclude that the pruned decision tree model performs significantly worse than the full decision tree model. However, the pruned decision tree model is easier to interpret and visualize.
+
+**Document results**:
+
+```{r}
+experiment2_documentation <- c('Decision tree', 'cp=0.0066',
+                               runtime_sec = round(dt2_runtime, 1),                               
+                               accuracy_95CI = paste0('(', round(dt2_accuracy_CI[1], 3), ', ', 
+                                                           round(dt2_accuracy_CI[2], 3), ')'),  
+                               recall_95CI = paste0('(', round(dt2_recall_CI[1], 3), ', ', 
+                                                         round(dt2_recall_CI[2], 3), ')'),  
+                               precision_95CI = paste0('(', round(dt2_precision_CI[1], 3), ', ', 
+                                                            round(dt2_precision_CI[2], 3), ')'), 
+                               'Pruning decreased runtime but also performance')
+experiment_tracker_df <- rbind(experiment_tracker_df, experiment2_documentation)
+```
+
+## 3.2. Random forest
+
+### 3.2.0. Experiment RF0
+
+**Objective**: Establish baseline performance for a random forest model of bank term deposits
+
+**Variation**: None (ie, use all features, default parameters)
+
+**Evaluation metric(s)**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `randomForest()`
+
+Parameters:
+
+-   `ntree` (number of trees) = 500 (default value). This is close to the rule of thumb to start with 10 times the number of features (ie, 49 features in training dataset $\times$ 10 = 490 trees).[^3]
+-   `mtry` (number of variables that are randomly sampled at each split) = 7 (default value). This is the square root of the number of features (ie, $\sqrt{49} = 7$).
+
+[^3]: Boehmke B and Greenwell B. (2020). Hands-On Machine Learning in R. Section 11.4.1. <https://bradleyboehmke.github.io/HOML/random-forest.html>
+
+```{r}
+rf0_runtime <- system.time(
+  rf0_model <- randomForest(has_term_deposit ~ ., data = train_smote))
+
+rf0_runtime <- rf0_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', rf0_runtime)
+```
+
+The variable importance plot shows three groups of variables ranked by importance. By far the most important feature in the model is `euribor_rate_3m`. Moderately important variables includes `has_housing_loanyes`, `consumer_confidence_index`, c`ommunication_typetelephone`, and `campaign_contacts`. Variables that are less important include highest level of education and job type.
+
+The important variables in the random forest model with all features are similar to those in the full decision tree model. Of note, `euribor_rate_3m` is the most important feature in both models. However, some variables have greater importance in the random forest model than the decision tree model. For example, `has_housing_loanyes` is the 2nd most important in the random forest model but is the 7th most important in the decision tree model. This most likely reflects the ensemble nature of the random forest algorithm (ie, it evaluates many different trees with different features).
+
+```{r}
+varImpPlot(rf0_model, main = 'Variable Importance in RF Model with All Features')
+```
+
+Use the model to make class predictions
+
+```{r}
+rf0_predictions <- predict(rf0_model, newdata = test, type = 'class')
+```
+
+Confusion matrix
+
+```{r}
+(rf0_confusion_matrix <- table(Actual = test$has_term_deposit, Predicted = rf0_predictions))
+```
+
+The accuracy, recall, and precision of the model are shown below.
+
+```{r}
+rf0_performance <- unlist(performance_metrics(rf0_confusion_matrix))
+rf0_accuracy <- rf0_performance[1]
+rf0_recall <- rf0_performance[2]
+rf0_precision <- rf0_performance[3]
+sprintf('Accuracy: %.3f, Recall: %.3f, Precision: %.3f', rf0_accuracy, rf0_recall, rf0_precision)
+```
+
+**Conclusion**: The baseline random forest model has moderately high accuracy (better than the baseline decision tree model, which was 0.864) but low recall and precision. However, these metrics may not be reliable estimates of its performance since cross-validation was not performed.
+
+**Document results**:
+
+```{r}
+experiment3_documentation <- c('Random forest', 'ntree = 500, mtry = 7, no CV',
+                               runtime_sec = round(rf0_runtime, 1),
+                               accuracy_95CI = round(rf0_accuracy, 3),  
+                               recall_95CI = round(rf0_recall, 3), 
+                               precision_95CI = round(rf0_precision, 3), 
+                               'Baseline. Slower than DT.')
+experiment_tracker_df <- rbind(experiment_tracker_df, experiment3_documentation)
+```
+
+### 3.2.1. Experiment RF1
+
+**Objective**: Compare baseline performance for a random forest model using cross-validation
+
+**Variation**: 10-fold cross-validation
+
+**Evaluation metrics**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `randomForest()`
+
+Parameters:
+
+-   `ntree` = 500 (default value)
+-   `mtry` = 7 (default value)
+
+10-fold cross-validation
+
+```{r}
+rf1_runtime <- system.time(
+  experiment3_results <- lapply(folds, function(x) {
+    # Training and test datasets
+    exp_train <- train_smote[-x, ]
+    exp_test <- train_smote[x, ]
+    # Use training data to create random forest classification model
+    exp_model <- randomForest(has_term_deposit ~ ., data = exp_train)
+    # Make predictions on test data
+    exp_predictions <- predict(exp_model, newdata = exp_test, type = 'class')
+    # Actual (true) data for comparison
+    exp_actual <- exp_test$has_term_deposit
+    # Create confusion matrix of actual vs predicted classes
+    exp_confusion_matrix <- table(exp_actual, exp_predictions)
+    # Calculate performance metrics from confusion matrix
+    exp_performance <- unlist(performance_metrics(exp_confusion_matrix))
+    exp_accuracy <-  exp_performance[1]
+    exp_recall <- exp_performance[2]
+    exp_precision <- exp_performance[3]
+    return(list(exp_accuracy, exp_recall, exp_precision))
+  }))
+
+rf1_runtime <- rf1_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', rf1_runtime)
+```
+
+```{r}
+# Convert results list of lists to dataframe
+experiment3_results_df <- as.data.frame(t(data.frame(lapply(experiment3_results, unlist))))
+colnames(experiment3_results_df) <- c('Accuracy', 'Recall', 'Precision')
+experiment3_results_df
+```
+
+The 95% confidence interval for accuracy, recall, and precision is shown below. Recall, in particular, is quite high (\~95%).
+
+```{r}
+# Accuracy
+rf1_accuracy_CI <- unlist(calc_ci95(mean(experiment3_results_df$Accuracy), 
+                                      sd(experiment3_results_df$Accuracy), 
+                                      nrow(experiment3_results_df)))
+sprintf('Accuracy 95%% CI: (%.3f, %.3f)', rf1_accuracy_CI[1], rf1_accuracy_CI[2])
+
+# Recall
+rf1_recall_CI <- unlist(calc_ci95(mean(experiment3_results_df$Recall), 
+                                      sd(experiment3_results_df$Recall), 
+                                      nrow(experiment3_results_df)))
+sprintf('Recall 95%% CI: (%.3f, %.3f)', rf1_recall_CI[1], rf1_recall_CI[2])
+
+# Precision
+rf1_precision_CI <- unlist(calc_ci95(mean(experiment3_results_df$Precision), 
+                                      sd(experiment3_results_df$Precision), 
+                                      nrow(experiment3_results_df)))
+sprintf('Precision 95%% CI: (%.3f, %.3f)', rf1_precision_CI[1], rf1_precision_CI[2])
+```
+
+**Conclusion**: Using cross-validation shows that the baseline random forest model performs well (accuracy \~94%) and has balanced recall and precision (\~95% and \~91%, respectively). Furthermore, since the confidence intervals for these metrics in this experiment is greater than and do not overlap those from [3.1.1. Experiment DT1], we can conclude that the baseline random forest model performs significantly better than the baseline decision tree model.
+
+**Document results**:
+
+```{r}
+experiment3_documentation <- c('Random forest', '10-fold CV',
+                               runtime_sec = round(rf1_runtime, 1),
+                               accuracy_95CI = paste0('(', round(rf1_accuracy_CI[1], 3), ', ', 
+                                                           round(rf1_accuracy_CI[2], 3), ')'),  
+                               recall_95CI = paste0('(', round(rf1_recall_CI[1], 3), ', ', 
+                                                         round(rf1_recall_CI[2], 3), ')'),  
+                               precision_95CI = paste0('(', round(rf1_precision_CI[1], 3), ', ', 
+                                                            round(rf1_precision_CI[2], 3), ')'), 
+                               'Performance > decision tree. Long runtime.')
+experiment_tracker_df <- rbind(experiment_tracker_df, experiment3_documentation)
+```
+
+### 3.2.2. Experiment RF2
+
+**Objective**: Determine whether considering more features at each split in the random forest model increases recall by $\ge 5\%$.
+
+**Variations**: Increase the value of `mtry` from 7 (default) to 14
+
+-   I hypothesized that a higher value of `mtry` may improve model performance because it would increase the probability that the set of candidate variables at each split contains the most important variable from [3.2.0. Experiment RF0] (`euribor3m`).[^4] This variation would be expected to reduce bias in the model but increase variance.[^5]
+
+-   Note: I also considered setting `importance` to TRUE (default = FALSE) to assess the importance of predictors; however, this greatly increased computation time and was not feasible to implement.
+
+[^4]: Probst P, Wright MN, and Boulesteix A-L. Hyperparameters and tuning strategies for random forest. *Data Mining Knowl Discov*. 2019;9:e1301. DOI: [10.1002/widm.1301](https://doi.org/10.1002/widm.1301)
+
+[^5]: <https://codemia.io/knowledge-hub/path/setting_values_for_ntree_and_mtry_for_random_forest_regression_model>
+
+**Evaluation metric(s)**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `randomForest()`
+
+Parameters:
+
+-   `ntree` = 500 (default value)
+-   `mtry` = 14
+
+10-fold cross-validation
+
+```{r}
+rf2_runtime <- system.time(
+  experiment4_results <- lapply(folds, function(x) {
+    # Training and test datasets
+    exp_train <- train_smote[-x, ]
+    exp_test <- train_smote[x, ]
+    # Use training data to create random forest classification model
+    exp_model <- randomForest(has_term_deposit ~ ., data = exp_train, mtry = 14)
+    # Make predictions on test data
+    exp_predictions <- predict(exp_model, newdata = exp_test, type = 'class')
+    # Actual (true) data for comparison
+    exp_actual <- exp_test$has_term_deposit
+    # Create confusion matrix of actual vs predicted classes
+    exp_confusion_matrix <- table(exp_actual, exp_predictions)
+    # Calculate performance metrics from confusion matrix
+    exp_performance <- unlist(performance_metrics(exp_confusion_matrix))
+    exp_accuracy <-  exp_performance[1]
+    exp_recall <- exp_performance[2]
+    exp_precision <- exp_performance[3]
+    return(list(exp_accuracy, exp_recall, exp_precision))
+  }))
+
+rf2_runtime <- rf2_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', rf2_runtime)
+```
+
+```{r}
+experiment4_results_df <- as.data.frame(t(data.frame(lapply(experiment4_results, unlist))))
+colnames(experiment4_results_df) <- c('Accuracy', 'Recall', 'Precision')
+experiment4_results_df
+```
+
+The 95% confidence interval for accuracy, recall, and precision is shown below. Recall, in particular, is high (\~95%).
+
+```{r}
+# Accuracy
+rf2_accuracy_CI <- unlist(calc_ci95(mean(experiment4_results_df$Accuracy), 
+                                      sd(experiment4_results_df$Accuracy), 
+                                      nrow(experiment4_results_df)))
+sprintf('Accuracy 95%% CI: (%.3f, %.3f)', rf2_accuracy_CI[1], rf2_accuracy_CI[2])
+
+# Recall
+rf2_recall_CI <- unlist(calc_ci95(mean(experiment4_results_df$Recall), 
+                                      sd(experiment4_results_df$Recall), 
+                                      nrow(experiment4_results_df)))
+sprintf('Recall 95%% CI: (%.3f, %.3f)', rf2_recall_CI[1], rf2_recall_CI[2])
+
+# Precision
+rf2_precision_CI <- unlist(calc_ci95(mean(experiment4_results_df$Precision), 
+                                      sd(experiment4_results_df$Precision), 
+                                      nrow(experiment4_results_df)))
+sprintf('Precision 95%% CI: (%.3f, %.3f)', rf2_recall_CI[1], rf2_recall_CI[2])
+```
+
+**Conclusion**: The objective was not met. Increasing `mtry` from 7 to 14 did not result in any change in recall. The overlapping confidence intervals for the three performance metrics in experiments 3 and 4 show that the performance of the two random forest models is not significantly different.
+
+**Document results**:
+
+```{r}
+experiment4_documentation <- c('Random forest', 'mtry = 14',
+                               runtime_sec = round(rf2_runtime, 1),
+                               accuracy_95CI = paste0('(', round(rf2_accuracy_CI[1], 3), ', ', 
+                                                           round(rf2_accuracy_CI[2], 3), ')'),  
+                               recall_95CI = paste0('(', round(rf2_recall_CI[1], 3), ', ', 
+                                                         round(rf2_recall_CI[2], 3), ')'),  
+                               precision_95CI = paste0('(', round(rf2_precision_CI[1], 3), ', ', 
+                                                            round(rf2_precision_CI[2], 3), ')'),  
+                               'Similar performance. Long runtime.')
+experiment_tracker_df <- rbind(experiment_tracker_df, experiment4_documentation)
+```
+
+## 3.3. Adaboost
+
+### 3.3.1. Experiment AB1
+
+**Objective**: Establish baseline performance for an AdaBoost model of bank term deposits
+
+**Variation**: None
+
+**Evaluation metric(s)**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `adabag::boosting.cv()`
+
+Parameters:
+
+-   `mfinal` (number of weak learners in the final ensemble model): Due to excessively long computation time with the default value of 100, I reduced it to 50.
+
+-   `v` (v-fold cross-validation): 10 (default value)
+
+-   Decision tree control: `maxdepth` = 1 corresponds to decision tree stumps since AdaBoost leverages weak learners
+
+```{r}
+ab1_runtime <- system.time(
+  ab1_obj <- boosting.cv(has_term_deposit ~ ., data = train_smote, mfinal = 50,
+                         control = rpart.control(maxdepth = 1)))
+
+ab1_runtime <- ab1_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', ab1_runtime)
+```
+
+Confusion matrix
+
+```{r}
+(ab1_confusion_matrix <- ab1_obj$confusion)
+```
+
+Average error (sum of weights of misclassified data)
+
+```{r}
+(ab1_error <- ab1_obj$error)
+```
+
+The 95% confidence interval for accuracy, recall, and precision is shown below. Recall, in particular, is moderate (\~82%).
+
+```{r}
+# I transposed the confusion matrix from the boosting.cv() output object to make it compatible with 
+# my performance_metrics() function, which assumes that actual (observed) classes are rows and 
+# predicted classes are columns
+ab1_performance <- unlist(performance_metrics(t(ab1_confusion_matrix)))
+ab1_accuracy <- ab1_performance[1]
+ab1_recall <- ab1_performance[2]
+ab1_precision <- ab1_performance[3]
+sprintf('Accuracy: %.3f, Recall: %.3f, Precision: %.3f', ab1_accuracy, ab1_recall, ab1_precision)
+```
+
+**Conclusion**: The baseline AdaBoost model has moderate performance. Statistical comparison with the decision tree and random forest algorithms is not possible due to differences in how the `adabag::boosting.cv()` function performs cross-validation (ie, the folds are most likely different). However, the performance metrics suggest that the baseline AdaBoost model is inferior to the decision tree and random forest models.
+
+Note: I was not able to adapt the `adabag::boosting()` function without cross-validation to the `lapply()` function that I used to perform cross-validation with decision tree and random forest models. The computation time for even a single `boosting()` iteration was very long (longer than `boosting.cv`), which made multiple iterations impossible. This is most likely due to the sequential nature of the AdaBoost algorithm.
+
+**Document results**:
+
+```{r}
+experiment5_documentation <- c('Adaboost', 'mfinal = 50, maxdepth = 1, 10-fold CV',
+                               runtime_sec = round(ab1_runtime, 1),
+                               accuracy_95CI = round(ab1_accuracy, 3),  
+                               recall_95CI = round(ab1_recall, 3), 
+                               precision_95CI = round(ab1_precision, 3), 
+                               'Baseline. Long runtime.')
+experiment_tracker_df <- rbind(experiment_tracker_df, experiment5_documentation)
+```
+
+### 3.3.2. Experiment AB2
+
+**Objective**: Determine whether increasing tree depth in the AdaBoost ensemble model increases recall by $\ge 5\%$.
+
+**Variation**: Increase `maxdepth` from 1 (tree stump) to 2
+
+-   I hypothesized that increasing tree depth creates stronger learners (ie, better fit); however, I limited the increase to keep the learners relatively weak (which is the aim of AdaBoost). This variation is expected to reduce bias but increase variance.
+
+**Evaluation metric(s)**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `adabag::boosting.cv()`
+
+Parameters:
+
+-   `mfinal`= 50
+
+-   `v` = 10 (default value)
+
+-   Decision tree control: `maxdepth` = 2
+
+```{r}
+ab2_runtime <- system.time(
+  ab2_obj <- boosting.cv(has_term_deposit ~ ., data = train_smote, mfinal = 50,
+                         control = rpart.control(maxdepth = 2)))
+
+ab2_runtime <- ab2_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', ab2_runtime)
+```
+
+Confusion matrix
+
+```{r}
+(ab2_confusion_matrix <- ab2_obj$confusion)
+```
+
+Average error
+
+```{r}
+(ab2_error <- ab2_obj$error)
+```
+
+The 95% confidence interval for accuracy, recall, and precision is shown below. Recall, in particular, increased 5.7% compared with the previous experiment.
+
+```{r}
+ab2_performance <- unlist(performance_metrics(t(ab2_confusion_matrix)))
+ab2_accuracy <- ab2_performance[1]
+ab2_recall <- ab2_performance[2]
+ab2_precision <- ab2_performance[3]
+sprintf('Accuracy: %.3f, Recall: %.3f, Precision: %.3f', ab2_accuracy, ab2_recall, ab2_precision)
+```
+
+```{r}
+sprintf('Recall increased %.1f%%', 100 * (ab2_recall - ab1_recall) / ab1_recall)
+```
+
+**Conclusion**: The objective was met. Increasing the tree depth from 1 to 2 in the Adaboost model increased recall by \>5%. As noted in the previous experiment ([3.3.1. Experiment AB1]), statistical comparison with other models is not possible. However, the performance metrics suggest that even with improvement, the performance of the AdaBoost model still lags behind that of decision trees and random forest models.
+
+**Document results**:
+
+```{r}
+experiment6_documentation <- c('Adaboost', 'maxdepth = 2',
+                               runtime_sec = round(ab2_runtime, 1),
+                               accuracy_95CI = round(ab2_accuracy, 3),  
+                               recall_95CI = round(ab2_recall, 3), 
+                               precision_95CI = round(ab2_precision, 3), 
+                               'Increased tree depth improved performance')
+experiment_tracker_df <- rbind(experiment_tracker_df, experiment6_documentation)
+```
+
+# 4. Summary of findings and recommendations
+
+The outcomes of the machine learning experiments are summarized below:
+
+```{r}
+experiment_tracker_df %>%
+  gt() %>%
+  # Define column widths
+  cols_width(
+    ends_with('_95CI') ~ pct(15)
+  ) %>%
+  # Highlight cells of interest
+  tab_style(
+    style = cell_fill(color = 'wheat'),
+    locations = cells_body(
+      columns = recall_95CI,
+      rows = (model == 'Decision tree') & (variation == 'cp=0.0066') 
+    )
+  ) %>% 
+  tab_style(
+    style = cell_fill(color = 'slategray1'),
+    locations = cells_body(
+      columns = runtime_sec,
+      rows = (model == 'Decision tree') & (variation == 'cp=0.0066') 
+    )
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(
+      columns = model,
+      rows = (model == 'Decision tree') & (variation == 'cp=0.0066') 
+    )
+  ) %>%
+  tab_style(
+    style = cell_fill(color = 'wheat'),
+    locations = cells_body(
+      columns = recall_95CI,
+      rows = (model == 'Random forest') & (variation == '10-fold CV') 
+    )
+  ) %>%
+  tab_style(
+    style = cell_fill(color = 'slategray1'),
+    locations = cells_body(
+      columns = runtime_sec,
+      rows = (model == 'Random forest') & (variation == '10-fold CV')
+    )
+  ) %>%
+  tab_style(
+    style = list(cell_text(weight = 'bold')),
+    locations = cells_body(
+      columns = model,
+      rows = (model == 'Random forest') & (variation == '10-fold CV')
+    )
+  ) %>%
+  # Boldface column labels
+  tab_style(
+    style = "font-weight: bold",
+    locations = cells_column_labels()
+  ) 
+```
+
+<br>
+
+Key findings:
+
+-   Overall, the random forest model with default parameters had the best classification performance with \~95% recall; however, it required the most computation time.
+
+    -   Increasing the number of features at each split (`mtry`) did not significantly affect classification performance.
+
+-   The decision tree model without pruning had the second best classification performance with \~90% recall.
+
+    -   Although the performance of the decision tree model was a little less than that for the random forest model, the latter required much more computation time.
+
+    -   Pruning significantly decreased recall to \~82% but improved interpretability and facilitated visualization.
+
+-   In both the random forest and decision tree models, the most important variable was the 3-month Euro interbank offered rate (`eurobor_rate_3m`).
+
+-   The Adaboost model with maxdepth = 1 (ie, tree stumps) had the worst classification performance with \~82% recall.
+
+    -   Increasing tree depth to 2 improved classification performance (recall \~87%). This is comparable or better than that for the decision tree models; however, no statistical comparison could be made.
+
+    -   The computation time needed for Adaboost is an order of magnitude greater than that for decision trees; it is similar to the time needed for random forest but is inferior in terms of classification performance.
+
+-   Cross-validation increased computation time but provides more reliable performance metrics than single point estimates
+
+<br>
+
+This analysis has two main limitations:
+
+1.  k-fold cross-validation could not be implemented consistently across algorithms. Due to differences in generated folds for decision tree and random forest models vs Adaboost models, statistical comparison of the performance among all three algorithms was not possible.
+
+2.  The number of model variations was very small. In practice, hyperparameter tuning would need to be performed more systematically (eg, grid search) to determine the optimal value of hyperparameters.
+
+<br>
+
+In conclusion, the random forest model with default parameters achieved the best recall (\~95%). From a purely classification performance perspective (ie, for data science), this is the best model for the bank term deposit classification problem. However, if interpretability and/or computation time are important (ie, business considerations), a decision tree model with \~82% recall (perhaps higher with additional tuning) may be an acceptable alternative.
