@@ -1,0 +1,764 @@
+---
+title: "DATA622 Assignment 3"
+author: "Alexander Simon"
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Libraries
+# ---------
+library(caret)  # Machine learning package. Version 7.0-1
+library(kernlab)  # For SVM. Version 0.9-33
+library(Matrix)  # Matrix functions (used for one-hot encoding). Version 1.7-3
+library(smotefamily)  # Implements SMOTE algorithm. Version 1.4.0
+library(tidyverse)  # Version 2.0.0
+library(gt)  # Format tables. Version 1.1.0
+library(kableExtra)
+library(doParallel)  # Enables parallel computation. Version 1.0.17
+library(foreach)  # Parallelizes loops. Version 1.5.2
+
+# Variables
+# ---------
+# Number of cores for parallel processing
+n_cores <- 8
+
+# The vectors below summarize the performance of models created in Assignment 2
+# These are used to pre-populate the experiment tracker and compare SVM performance
+# Note: Training times differ from those reported in Assignment 2 because 
+# I reran the algorithms using parallel processing, so the times are comparable with 
+# those in this assignment.
+DT0_performance_results <- c('Decision tree', 'DT0', 'No pruning, no CV', 4.5, 
+                             0.864, 0, 0.864, 
+                             0.365, 0, 0.365, 
+                             0.392, 0, 0.392, 
+                             'Baseline. Fast. Large tree.')
+DT1_performance_results <- c('Decision tree', 'DT1', '10-fold CV', 8.8, 
+                             0.890, 0.004, '(0.887, 0.892)', 
+                             0.902, 0.005, '(0.899, 0.905)', 
+                             0.863, 0.007, '(0.859, 0.868)', 
+                            'Good performance. High recall')
+DT2_performance_results <- c('Decision tree', 'DT2', 'cp=0.0066', 5.0, 
+                             0.763, 0.015,  '(0.754, 0.772)', 
+                             0.816, 0.008, '(0.811, 0.821)', 
+                             0.651, 0.035, '(0.629, 0.672)', 
+                            'Decreased runtime but also performance')
+RF0_performance_results <- c('Random forest', 'RF0', 'ntree = 500, mtry = 7, no CV', 70.2, 
+                             0.893, 0, 0.893, 
+                             0.491, 0, 0.491, 
+                             0.375, 0, 0.375, 
+                            'Baseline. Slower than DT.')
+RF1_performance_results <- c('Random forest', 'RF1', '10-fold CV', 142.3, 
+                             0.936, 0.002, '(0.935, 0.938)', 
+                             0.949, 0.004, '(0.947, 0.951)', 
+                             0.916, 0.006, '(0.912, 0.92)', 
+                            'Performance > decision tree.')
+RF2_performance_results <- c('Random forest', 'RF2', 'mtry = 14', 153.1, 
+                             0.938, 0.003, '(0.936, 0.939)', 
+                             0.948, 0.003, '(0.946, 0.95)', 
+                             0.920, 0.005, '(0.917, 0.923)', 
+                            'Similar performance.')
+AB0_performance_results <- c('Adaboost', 'AB0', 'mfinal = 50, maxdepth = 1, 10-fold CV', 
+                             744.2, 
+                             0.8, 0, 0.8, 
+                             0.826, 0, 0.826, 
+                             0.737, 0, 0.737, 
+                             'Baseline. Long runtime.')
+AB1_performance_results <- c('Adaboost', 'AB2', 'maxdepth = 2', 382.2, 
+                             0.833, 0, 0.833, 
+                             0.874, 0, 0.874, 
+                             0.759, 0, 0.759, 
+                             'Improved performance.')
+
+# Create experiment tracker dataframe
+experiment_tracker_df <- as.data.frame(rbind(DT0_performance_results, 
+                            DT1_performance_results, 
+                            DT2_performance_results, 
+                            RF0_performance_results, 
+                            RF1_performance_results, 
+                            RF2_performance_results, 
+                            AB0_performance_results, 
+                            AB1_performance_results))
+colnames(experiment_tracker_df) <- c('algorithm', 'model_id', 'variation', 'runtime_sec', 
+                                    'accuracy_mean', 'accuracy_sd', 'accuracy_95CI',
+                                    'recall_mean', 'recall_sd', 'recall_95CI', 
+                                    'precision_mean', 'precision_sd', 'precision_95CI',
+                                    'notes')
+
+# Functions
+# ---------
+# performance_metrics() returns a list with accuracy, recall, and precision given a 
+# confusion matrix. It assumes that actual classes are rows and predicted classes are columns
+performance_metrics <- function(confusion_matrix) {
+  true_negatives <- confusion_matrix[1, 1]  
+  true_positives <- confusion_matrix[2, 2]
+  false_negatives <- confusion_matrix[1, 2]
+  false_positives <- confusion_matrix[2, 1]
+  
+  accuracy <- (true_positives + true_negatives) / 
+              (true_positives + true_negatives + false_positives + false_negatives)
+  recall <- true_positives / (true_positives + false_negatives)
+  precision <- true_positives / (true_positives + false_positives)
+  
+  return(list(accuracy, recall, precision))
+}
+
+# calc_ci95() returns a list of the lower and upper bounds of the
+# 95% confidence interval for a variable given its mean, SD, and n
+calc_ci95 <- function(mean, sd, n) {
+  upper_bound = mean + 1.96 * (sd / sqrt(n))
+  lower_bound = mean - 1.96 * (sd / sqrt(n))
+  return(list(lower_bound, upper_bound))
+}
+
+# Randomization seed
+set.seed(1024)
+```
+
+This assignment implements a support vector machine (SVM) model of the [UCI bank marketing datasets](https://archive.ics.uci.edu/dataset/222/bank+marketing) to predict whether a client will subscribe to a term deposit and compares its performance with decision trees, random forest, and AdaBoost models ([Assignment 2](https://rpubs.com/alexandersimon1/data622_assignment2)). Exploratory data analysis was performed previously ([Assignment 1](https://rpubs.com/alexandersimon1/data622_assignment1)).
+
+# 1. Setup
+
+## 1.1. Data input
+
+For this assignment, I focus on the `bank_additional_full` dataset.
+
+```{r message=FALSE}
+url <- 'https://raw.githubusercontent.com/alexandersimon1/Data622/refs/heads/main/Assignment1/bank-additional-full.csv'
+bank_additional_full_df <- read_delim(url, delim = ';', show_col_types = FALSE)
+```
+
+```{r}
+# Rename columns to make them more descriptive
+bank_additional_full_df <- bank_additional_full_df %>%
+  select(age,
+         job_type = job, 
+         marital_status = marital, 
+         highest_education = education,
+         credit_is_defaulted = default,
+         has_housing_loan = housing,
+         has_personal_loan = loan,
+         communication_type = contact,
+         last_contact_dow = day_of_week,
+         last_contact_month = month,
+         last_contact_duration_sec = duration,
+         campaign_contacts = campaign,
+         days_since_last_contact = pdays,
+         previous_contacts = previous,
+         previous_contact_outcome = poutcome,
+         employee_variation_rate = emp.var.rate,
+         consumer_price_index = cons.price.idx,
+         consumer_confidence_index = cons.conf.idx,
+         euribor_rate_3m = euribor3m,
+         n_employees = nr.employed,
+         has_term_deposit = y)
+
+# Coerce categorical variables to factors
+categorical_variables <- c('job_type', 'marital_status', 'highest_education',
+                           'communication_type', 'previous_contact_outcome',
+                           'last_contact_dow', 'last_contact_month',
+                           'credit_is_defaulted', 'has_housing_loan',
+                           'has_personal_loan', 'has_term_deposit')
+
+bank_additional_full_df <- bank_additional_full_df %>%
+mutate_at(categorical_variables, factor)
+```
+
+## 1.2. Pre-processing
+
+I pre-processed the data in the same way for previously explored models. I one-hot encoded categorical variables, split the data 70:30, and balanced the training set using SMOTE. I also created 10 folds from the balanced training dataset for cross-validation. For details, see [Assignment 2](https://rpubs.com/alexandersimon1/data622_assignment2).
+
+```{r}
+# Remove duplicates
+# -----------------
+bank_additional_full_df <- bank_additional_full_df %>%
+  distinct()
+
+# Dropped variables
+# -----------------
+# Drop highly correlated variables and last contact duration to avoid target leakage
+bank_additional_full_df2 <- bank_additional_full_df %>%
+  select(-c(employee_variation_rate, n_employees, last_contact_duration_sec))
+
+# One-hot encoding
+# ----------------
+# Encode all variables except target variable (has_term_deposit)
+bank_additional_full_dgCMatrix <- sparse.model.matrix(~ . -has_term_deposit,
+                                           data = bank_additional_full_df2)
+
+# Remove first column of sparse matrix, which is artifact of conversion
+bank_additional_full_dgCMatrix <- bank_additional_full_dgCMatrix[ , -1]
+
+# Convert sparse matrix to dataframe
+bank_additional_full_df3 <- as.data.frame(as.matrix(bank_additional_full_dgCMatrix))
+
+# Rename variables to syntactically valid names to avoid issues with subsequent functions
+colnames(bank_additional_full_df3) <- make.names(names(bank_additional_full_df3))
+
+# Replace target variable and encode as numeric values
+bank_additional_full_df3 <-
+  cbind(bank_additional_full_df3,
+        has_term_deposit = bank_additional_full_df2$has_term_deposit) %>%
+  mutate(
+    has_term_deposit = ifelse(has_term_deposit == 'yes', 1, 0)
+  )
+
+# Create training and test datasets (70:30 split)
+# -----------------------------------------------
+train_idx <- createDataPartition(bank_additional_full_df3$has_term_deposit, p = 0.7, 
+                                 list = FALSE)
+train_imbalanced <- bank_additional_full_df3[train_idx, ]
+test <- bank_additional_full_df3[-train_idx, ]
+
+# Balance training set with SMOTE
+# -------------------------------
+# Use default value of K=5 for the number of nearest neighbors during sampling
+train_smote <- SMOTE(train_imbalanced[, -train_imbalanced$has_term_deposit],
+                     train_imbalanced$has_term_deposit)
+train_smote <- train_smote$data  # extract the balanced dataset
+
+# Revert target variable to categorical values and
+# remove 'class' variable (artifact of SMOTE function)
+train_smote <- train_smote %>%
+  mutate(
+    has_term_deposit = ifelse(has_term_deposit == 1, 'yes', 'no')
+  ) %>%
+  select(-c(class))
+train_smote$has_term_deposit <- as.factor(train_smote$has_term_deposit)
+
+# Cross-validation folds
+# ----------------------
+folds <- createFolds(train_smote$has_term_deposit, k = 10)
+```
+
+# 2. Performance evaluation
+
+Classification performance is assessed using accuracy, precision, recall, and model training time. Statistically significant differences in performance between models is evaluated using 95% confidence intervals calculated from 10-fold cross-validation results. The threshold for statistical significance is $\alpha = 0.05$.
+
+## 2.1. Performance of previous models
+
+For reference, the performance of the models I created in Assignment 2 are summarized below:
+
+```{r}
+# Remove rownames from tracker dataframe
+rownames(experiment_tracker_df) <- NULL
+
+# View the tracker
+experiment_tracker_df %>%
+  select(c(model_id, variation, runtime_sec, accuracy_95CI, recall_95CI, precision_95CI, notes)) %>%  
+  kbl() %>%
+  kable_styling() %>%
+  footnote(general = 'Abbreviations: AB, AdaBoost; DT, decision tree; RF, random forest.', general_title = '')  
+```
+
+# 3. SVM experiments
+
+## 3.1. Experiment SVM0
+
+**Objective**: Establish baseline performance for a SVM model of bank term deposits
+
+**Variation**: None (ie, use all features, no cross-validation)
+
+**Evaluation metrics**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `ksvm()`
+
+Parameters:
+
+-   `kernel = rbfdot` This uses the Gaussian radial basis function, which is recommended as a starting point when fitting SVMs[^1]
+-   `kpar` (kernel parameters) = "automatic" (default value). According to the `ksvm()` documentation, this uses heuristics to calculate a "good" value for the `sigma` parameter (inverse kernel width for the radial basis function).[^2]
+-   `C` (cost of constraints violation) = 1 (default value)
+
+[^1]: <https://bradleyboehmke.github.io/HOML/svm.html>
+
+[^2]: <https://cran.r-project.org/web/packages/kernlab/kernlab.pdf>, page 56.
+
+```{r}
+# Train the model
+svm0_runtime <- system.time(
+  svm0_model <- ksvm(has_term_deposit ~ ., data = train_smote, kernel = 'rbfdot')
+)
+svm0_runtime <- svm0_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', svm0_runtime)
+```
+
+Use the model to make class predictions
+
+```{r}
+svm0_predictions <- predict(svm0_model, newdata = test, type = 'response')
+```
+
+Confusion matrix
+
+```{r}
+(svm0_confusion_matrix <- table(Actual = test$has_term_deposit, Predicted = svm0_predictions))
+```
+
+The accuracy, recall, and precision of the model are shown below.
+
+```{r}
+svm0_performance <- unlist(performance_metrics(svm0_confusion_matrix))
+svm0_accuracy <- svm0_performance[1]
+svm0_recall <- svm0_performance[2]
+svm0_precision <- svm0_performance[3]
+sprintf('Accuracy: %.3f, Recall: %.3f, Precision: %.3f', 
+        svm0_accuracy, svm0_recall, svm0_precision)
+```
+
+**Conclusion**: The baseline SVM model has moderately high accuracy but low recall and precision. Its accuracy and recall are between those of the baseline decision tree and baseline random forest models, but it achieved the highest precision. However, these metrics may not be reliable estimates of its performance since cross-validation was not performed.
+
+**Document results**:
+
+```{r}
+SVM0_performance_results <- c('Support vector machine', 'SVM0', 'RBF kernel, no CV', 
+                               runtime_sec = round(svm0_runtime, 1),
+                               accuracy_mean = round(svm0_accuracy, 3), accuracy_sd = 0,
+                               accuracy_95CI = round(svm0_accuracy, 3),  
+                               recall_mean = round(svm0_recall, 3), recall_sd = 0,
+                               recall_95CI = round(svm0_recall, 3), 
+                               precision_mean = round(svm0_precision, 3), precision_sd = 0,
+                               precision_95CI = round(svm0_precision, 3), 
+                              'Baseline. Slower than RF.')
+
+experiment_tracker_df <- rbind(experiment_tracker_df, SVM0_performance_results)
+```
+
+## 3.2. Experiment SVM1
+
+**Objective**: Compare baseline performance for a SVM model using cross-validation
+
+**Variation**: 10-fold cross-validation
+
+**Evaluation metrics**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `ksvm()`
+
+Parameters:
+
+-   `kernel = rbfdot`
+-   `kpar` (kernel parameters) = "automatic" (default value)
+-   `C` (cost of constraints violation) = 1 (default value)
+
+```{r}
+svm1_runtime <- system.time(
+  experiment5_results <- mclapply(folds, function(x) {
+    # Training and test datasets
+    exp_train <- train_smote[-x, ]
+    exp_test <- train_smote[x, ]
+    # Use training data to create decision tree classification model
+    exp_model <- ksvm(has_term_deposit ~ ., data = exp_train, kernel = 'rbfdot')
+    # Make predictions on test data
+    exp_predictions <- predict(exp_model, newdata = exp_test, type = 'response')
+    # Actual (true) data for comparison
+    exp_actual <- exp_test$has_term_deposit
+    # Create confusion matrix of actual vs predicted classes
+    exp_confusion_matrix <- table(exp_actual, exp_predictions)
+    # Calculate performance metrics from confusion matrix
+    exp_performance <- unlist(performance_metrics(exp_confusion_matrix))
+    exp_accuracy <-  exp_performance[1]
+    exp_recall <- exp_performance[2]
+    exp_precision <- exp_performance[3]
+    return(list(exp_accuracy, exp_recall, exp_precision))
+  }, mc.cores = n_cores))
+
+svm1_runtime <- svm1_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', svm1_runtime)
+```
+
+```{r}
+# Convert results (list of lists) to dataframe
+experiment5_results_df <- as.data.frame(t(data.frame(lapply(experiment5_results, unlist))))
+colnames(experiment5_results_df) <- c('Accuracy', 'Recall', 'Precision')
+experiment5_results_df
+```
+
+The 95% confidence interval for accuracy, recall, and precision is shown below.
+
+```{r}
+# Accuracy
+svm1_accuracy_CI <- unlist(calc_ci95(mean(experiment5_results_df$Accuracy),
+                                      sd(experiment5_results_df$Accuracy),
+                                      nrow(experiment5_results_df)))
+sprintf('Accuracy 95%% CI: (%.3f, %.3f)', svm1_accuracy_CI[1], svm1_accuracy_CI[2])
+
+# Recall
+svm1_recall_CI <- unlist(calc_ci95(mean(experiment5_results_df$Recall),
+                                      sd(experiment5_results_df$Recall),
+                                      nrow(experiment5_results_df)))
+sprintf('Recall 95%% CI: (%.3f, %.3f)', svm1_recall_CI[1], svm1_recall_CI[2])
+
+# Precision
+svm1_precision_CI <- unlist(calc_ci95(mean(experiment5_results_df$Precision),
+                                      sd(experiment5_results_df$Precision),
+                                      nrow(experiment5_results_df)))
+sprintf('Precision 95%% CI: (%.3f, %.3f)', svm1_precision_CI[1], svm1_precision_CI[2])
+```
+
+**Conclusion**: Using cross-validation shows that the baseline SVM model performs moderately well (accuracy \~85%) but has better recall (\~90%) than precision (\~76%). Comparison of the performance metric confidence intervals with those of previous models (section 2.1) indicate that:
+
+-   The accuracy of the baseline SVM model is significantly worse than the decision tree models (full and pruned) as well as the random forest models. As explained in [Assignment 2](https://rpubs.com/alexandersimon1/data622_assignment2), statistical comparison with Adaboost performance is not possible; however, the accuracy of the 10-fold cross-validated Adaboost model suggest that the accuracy of the baseline SVM model is similar.
+
+-   The recall of the baseline SVM model is significantly better than the pruned decision tree model but significantly worse than the random forest models. Due to overlapping confidence intervals for the SVM and full decision tree models, the null hypothesis of no significant difference between the two models cannot be rejected. The recall of the 10-fold cross-validated Adaboost model suggest that the recall of the baseline SVM model is higher.
+
+-   The precision of the baseline SVM model is significantly better than the pruned decision tree model but significantly worse than the full decision tree model and the random forest models. The precision of the 10-fold cross-validated Adaboost model suggest that the precision of the baseline SVM model is similar.
+
+Overall, the performance of the baseline SVM model is better than decision tree models, similar to the Adaboost models, and worse than the random forest models. Of note, the baseline SVM model also had the longest training time.
+
+**Document results**:
+
+```{r}
+SVM1_performance_results <- 
+  c('Support vector machine', 'SVM1', '10-fold CV', runtime_sec = round(svm1_runtime, 1),
+  accuracy_mean = round(mean(experiment5_results_df$Accuracy), 3), 
+  accuracy_sd = round(sd(experiment5_results_df$Accuracy), 3),     
+  accuracy_95CI = paste0('(', round(svm1_accuracy_CI[1], 3), ', ',
+                         round(svm1_accuracy_CI[2], 3), ')'),
+  
+  recall_mean = round(mean(experiment5_results_df$Recall), 3), 
+  recall_sd = round(sd(experiment5_results_df$Recall), 3),   
+  recall_95CI = paste0('(', round(svm1_recall_CI[1], 3), ', ',
+                       round(svm1_recall_CI[2], 3), ')'),
+  
+  precision_mean = round(mean(experiment5_results_df$Precision), 3), 
+  precision_sd = round(sd(experiment5_results_df$Precision), 3),  
+  precision_95CI = paste0('(', round(svm1_precision_CI[1], 3), ', ',
+                          round(svm1_precision_CI[2], 3), ')'),
+  'Performance DT < SVM < RF.')
+
+experiment_tracker_df <- rbind(experiment_tracker_df, SVM1_performance_results)
+```
+
+## 3.3. Experiment SVM2
+
+**Objective**: Determine whether increasing the inverse kernel width (`sigma`) increases recall by $\ge 5\%$.
+
+**Variation**: Increase `sigma` to 0.1
+
+-   Previously, in experiment SVM0 (section 3.1), the "automatic" setting of the `kpar` argument determined `sigma` to be 0.0138.
+
+```{r}
+(svm0_model@kernelf@kpar$sigma)
+```
+
+-   `sigma` controls the radius of influence around a data point.[^3] Increasing it is expected to create a more general decision boundary, which will increase bias in the model and reduce variance (and overfitting).
+
+[^3]: <https://towardsdatascience.com/svm-hyperparameters-explained-with-visualizations-143e48cb701b/>
+
+**Evaluation metrics**: Accuracy, recall, precision
+
+**Perform the experiment**:
+
+Algorithm: `ksvm()`
+
+Parameters:
+
+-   `kernel = rbfdot`
+-   `kpar` (kernel parameters) = (`sigma = 0.1`)
+
+10-fold cross-validation
+
+```{r}
+svm2_runtime <- system.time(
+  experiment6_results <- mclapply(folds, function(x) {
+    # Training and test datasets
+    exp_train <- train_smote[-x, ]
+    exp_test <- train_smote[x, ]
+    # Use training data to create decision tree classification model
+    exp_model <- ksvm(has_term_deposit ~ ., data = exp_train, kernel = 'rbfdot', 
+                      kpar = list(sigma = 0.1))
+    # Make predictions on test data
+    exp_predictions <- predict(exp_model, newdata = exp_test, type = 'response')
+    # Actual (true) data for comparison
+    exp_actual <- exp_test$has_term_deposit
+    # Create confusion matrix of actual vs predicted classes
+    exp_confusion_matrix <- table(exp_actual, exp_predictions)
+    # Calculate performance metrics from confusion matrix
+    exp_performance <- unlist(performance_metrics(exp_confusion_matrix))
+    exp_accuracy <-  exp_performance[1]
+    exp_recall <- exp_performance[2]
+    exp_precision <- exp_performance[3]
+    return(list(exp_accuracy, exp_recall, exp_precision))
+  }, mc.cores = n_cores))
+
+svm2_runtime <- svm2_runtime[['elapsed']]
+sprintf('Runtime: %.1f seconds', svm2_runtime)
+```
+
+```{r}
+# Convert results (list of lists) to dataframe
+experiment6_results_df <- as.data.frame(t(data.frame(lapply(experiment6_results, unlist))))
+colnames(experiment6_results_df) <- c('Accuracy', 'Recall', 'Precision')
+experiment6_results_df
+```
+
+The 95% confidence interval for accuracy, recall, and precision is shown below. Of note, increasing `sigma` resulted in a 0.3% decrease in mean recall compared with the baseline SVM model.
+
+```{r}
+# Accuracy
+svm2_accuracy_CI <- unlist(calc_ci95(mean(experiment6_results_df$Accuracy),
+                                      sd(experiment6_results_df$Accuracy),
+                                      nrow(experiment6_results_df)))
+sprintf('Accuracy 95%% CI: (%.3f, %.3f)', svm2_accuracy_CI[1], svm2_accuracy_CI[2])
+
+# Recall
+svm2_recall_CI <- unlist(calc_ci95(mean(experiment6_results_df$Recall),
+                                      sd(experiment6_results_df$Recall),
+                                      nrow(experiment6_results_df)))
+sprintf('Recall 95%% CI: (%.3f, %.3f)', svm2_recall_CI[1], svm2_recall_CI[2])
+
+# Precision
+svm2_precision_CI <- unlist(calc_ci95(mean(experiment6_results_df$Precision),
+                                      sd(experiment6_results_df$Precision),
+                                      nrow(experiment6_results_df)))
+sprintf('Precision 95%% CI: (%.3f, %.3f)', svm2_precision_CI[1], svm2_precision_CI[2])
+```
+
+```{r}
+sprintf('Change in mean recall: %.1f%%', 
+        100 * (mean(experiment6_results_df$Recall) - 
+                 mean(experiment5_results_df$Recall)) /
+        mean(experiment5_results_df$Recall))
+```
+
+**Conclusion**: The objective was not met. Increasing `sigma` from 0.0138 to 0.1 decreased recall. Comparison of the confidence intervals for all three performance metrics with those of the baseline SVM model (experiment SVM1) indicate that the SVM2 variation significantly improved accuracy and precision, but did not significantly change recall. In addition, the variation more than doubled the model training time.
+
+**Document results**:
+
+```{r}
+SVM2_performance_results <- 
+  c('Support vector machine', 'SVM2', 'sigma = 0.1', runtime_sec = round(svm2_runtime, 1),
+  accuracy_mean = round(mean(experiment6_results_df$Accuracy), 3), 
+  accuracy_sd = round(sd(experiment6_results_df$Accuracy), 3),    
+  accuracy_95CI = paste0('(', round(svm2_accuracy_CI[1], 3), ', ',
+                         round(svm2_accuracy_CI[2], 3), ')'),
+  
+  recall_mean = round(mean(experiment6_results_df$Recall), 3), 
+  recall_sd = round(sd(experiment6_results_df$Recall), 3),    
+  recall_95CI = paste0('(', round(svm2_recall_CI[1], 3), ', ',
+                       round(svm2_recall_CI[2], 3), ')'),
+  
+  precision_mean = round(mean(experiment6_results_df$Precision), 3), 
+  precision_sd = round(sd(experiment6_results_df$Precision), 3),    
+  precision_95CI = paste0('(', round(svm2_precision_CI[1], 3), ', ',
+                          round(svm2_precision_CI[2], 3), ')'),
+  'Higher accuracy but similar recall. Long runtime.')
+
+experiment_tracker_df <- rbind(experiment_tracker_df, SVM2_performance_results)
+```
+
+# 4. Performance comparison
+
+The outcomes of all experiments (Assignments 2 and 3 combined) are summarized below:
+
+```{r}
+# Remove rownames from tracker dataframe
+rownames(experiment_tracker_df) <- NULL
+
+# View the tracker
+experiment_tracker_df %>%
+  select(c(model_id, variation, runtime_sec, 
+           accuracy_95CI, recall_95CI, precision_95CI, notes)) %>%
+  kbl() %>%
+  kable_styling() %>%
+  footnote(general = 'Abbreviations: AB, AdaBoost; DT, decision tree; RF, random forest; SVM, support vector machine.',
+           general_title = '')
+```
+
+## 4.1. Accuracy
+
+In general, the random forest models had the highest accuracy. The DT2 decision tree model had the lowest accuracy.
+
+```{r}
+experiment_tracker_df$accuracy_mean <- as.numeric(experiment_tracker_df$accuracy_mean)
+experiment_tracker_df$accuracy_sd <- as.numeric(experiment_tracker_df$accuracy_sd)
+
+ggplot(experiment_tracker_df, aes(x = factor(model_id), y = accuracy_mean, 
+                                  fill = factor(algorithm))) +
+  geom_bar(stat = 'identity') +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2)) +  
+  scale_fill_viridis_d('Algorithm') +
+  labs(x = 'Model', y = 'Mean accuracy', 
+       title = 'Comparison of model accuracy',
+       caption = paste0('Model 0 (no CV) and model 1 (with CV) are baseline models. ',
+                        'Model 2 is a hyperparameter variation.\n',
+                        'CV could not be implemented for AdaBoost (AB). ',
+                        'CV, cross-validation.')) +
+  guides(y = guide_axis(minor.ticks = TRUE, cap = 'upper')) +
+  theme_classic() +
+  theme(
+    axis.title = element_text(face = 'bold'),
+    plot.title =element_text(face = 'bold'),
+    plot.caption = element_text(color = "darkgray", hjust = 0)
+  )
+```
+
+## 4.2. Recall
+
+Among the cross-validated models, the random forest models (RF1 and RF2) had the highest recall. The DT2 decision tree model had the lowest recall.
+
+```{r}
+experiment_tracker_df$recall_mean <- as.numeric(experiment_tracker_df$recall_mean)
+experiment_tracker_df$recall_sd <- as.numeric(experiment_tracker_df$recall_sd)
+
+ggplot(experiment_tracker_df, aes(x = factor(model_id), y = recall_mean, 
+                                  fill = factor(algorithm))) +
+  geom_bar(stat = 'identity') +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2)) +
+  scale_fill_viridis_d('Algorithm') +
+  labs(x = 'Model', y = 'Mean recall', 
+       title = 'Comparison of model recall',
+       caption = paste0('Model 0 (no CV) and model 1 (with CV) are baseline models. ',
+                        'Model 2 is a hyperparameter variation.\n',
+                        'CV could not be implemented for AdaBoost (AB). ',
+                        'CV, cross-validation.')) +
+  guides(y = guide_axis(minor.ticks = TRUE, cap = 'upper')) +
+  theme_classic() +
+  theme(
+    axis.title = element_text(face = 'bold'),
+    plot.title = element_text(face = 'bold'),
+    plot.caption = element_text(color = "darkgray", hjust = 0)    
+  )
+```
+
+## 4.3. Precision
+
+Among the cross-validated models, the random forest models (RF1 and RF2) and the SVM2 model had the highest precision. The DT2 decision tree model had the lowest precision.
+
+```{r}
+experiment_tracker_df$precision_mean <- as.numeric(experiment_tracker_df$precision_mean)
+experiment_tracker_df$precision_sd <- as.numeric(experiment_tracker_df$precision_sd)
+
+ggplot(experiment_tracker_df, aes(x = factor(model_id), y = precision_mean, 
+                                  fill = factor(algorithm))) +
+  geom_bar(stat = 'identity') +
+  scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, by = 0.2)) +
+  scale_fill_viridis_d('Algorithm') +
+  labs(x = 'Model', y = 'Mean precision', 
+       title = 'Comparison of model precision',
+       caption = paste0('Model 0 (no CV) and model 1 (with CV) are baseline models. ',
+                        'Model 2 is a hyperparameter variation.\n',
+                        'CV could not be implemented for AdaBoost (AB). ',
+                        'CV, cross-validation.')) +
+  guides(y = guide_axis(minor.ticks = TRUE, cap = 'upper')) +
+  theme_classic() +
+  theme(
+    axis.title = element_text(face = 'bold'),
+    plot.title = element_text(face = 'bold'),
+    plot.caption = element_text(color = "darkgray", hjust = 0)    
+  )
+```
+
+## 4.4. Computation time
+
+In general, the decision tree models took the least time, while the AdaBoost models took the most. The random forest models were intermediate. The computation time for SVM varied from moderate (SVM1) to very long (SVM2).
+
+```{r}
+experiment_tracker_df$runtime_sec <- as.numeric(experiment_tracker_df$runtime_sec)
+
+ggplot(experiment_tracker_df, aes(x = factor(model_id), y = log10(runtime_sec), 
+                                  fill = factor(algorithm))) +
+  geom_bar(stat = 'identity') +
+  scale_fill_viridis_d('Algorithm') +
+  labs(x = 'Model', 
+       y = bquote(bold(log[10](time_sec))), 
+       title = 'Comparison of model computation time',
+       caption = paste0('Model 0 (no CV) and model 1 (with CV) are baseline models. ',
+                        'Model 2 is a hyperparameter variation.\n',
+                        'CV could not be implemented for AdaBoost (AB). ',
+                        'CV, cross-validation.')) +  
+  guides(y = guide_axis(minor.ticks = TRUE)) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(face = 'bold'),
+    plot.title = element_text(face = 'bold'),
+    plot.caption = element_text(color = "darkgray", hjust = 0)     
+  )
+```
+
+In addition, comparison of computation times with those from Assignment 2 shows that parallel processing reduces the computation time for all models except AdaBoost, which is most likely due to the sequential nature of the algorithm.
+
+```{r}
+# Create dataframe to compare computation times with/without parallel processing
+# Times without parallel processing are from Assignment 2
+# Comparison for SVM was not performed
+DT0_runtime_no_para <- c('Decision tree', 'DT0', 4.5, 'no')
+DT0_runtime_para <- c('Decision tree', 'DT0', 4.5, 'yes')
+DT1_runtime_no_para <- c('Decision tree', 'DT1', 40.5, 'no')
+DT1_runtime_para <- c('Decision tree', 'DT1', 8.8, 'yes')
+DT2_runtime_no_para <- c('Decision tree', 'DT2', 22.2, 'no')
+DT2_runtime_para <- c('Decision tree', 'DT2', 5.0, 'yes')
+RF0_runtime_no_para <- c('Random forest', 'RF0', 70.2, 'no')
+RF0_runtime_para <- c('Random forest', 'RF0', 70.2, 'yes')
+RF1_runtime_no_para <- c('Random forest', 'RF1', 629.7, 'no')
+RF1_runtime_para <- c('Random forest', 'RF1', 142.3, 'yes')
+RF2_runtime_no_para <- c('Random forest', 'RF2', 676.2, 'no')
+RF2_runtime_para <- c('Random forest', 'RF2', 153.1, 'yes')
+AB1_runtime_no_para <- c('AdaBoost', 'AB0', 744.2, 'no')
+AB1_runtime_para <- c('AdaBoost', 'AB0', 744.2, 'yes')
+AB2_runtime_no_para <- c('AdaBoost', 'AB2', 382.2, 'no')
+AB2_runtime_para <- c('AdaBoost', 'AB2', 382.2, 'yes')
+
+comp_time_df <- as.data.frame(rbind(DT0_runtime_no_para, DT0_runtime_para,
+                                    DT1_runtime_no_para, DT1_runtime_para,
+                                    DT2_runtime_no_para, DT2_runtime_para,
+                                    RF0_runtime_no_para, RF0_runtime_para,
+                                    RF1_runtime_no_para, RF1_runtime_para,
+                                    RF2_runtime_no_para, RF2_runtime_para,
+                                    AB1_runtime_no_para, AB1_runtime_para,
+                                    AB2_runtime_no_para, AB2_runtime_para))
+
+colnames(comp_time_df) <- c('algorithm', 'model_id', 'runtime_sec', 'multicore')
+
+comp_time_df$runtime_sec <- as.numeric(comp_time_df$runtime_sec)
+```
+
+```{r}
+ggplot(comp_time_df, aes(x = factor(model_id), y = log10(runtime_sec), 
+                                  fill = factor(multicore))) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  scale_fill_manual('Parallelization', values = c('#E1BE6A', '#40B0A6')) +
+  labs(x = 'Model', 
+       y = bquote(bold(log[10](time_sec))), 
+       title = 'Effect of parallel processing on model computation time',
+       caption = paste0('Model 0 (no CV) and model 1 (with CV) are baseline models. ',
+                  'Model 2 is a hyperparameter variation.\n',
+                  'CV could not be implemented for AdaBoost (AB). ',
+                  'SVM models not shown as they were not run without parallelization.\n',
+                  'CV, cross-validation.')) +  
+  guides(y = guide_axis(minor.ticks = TRUE)) +
+  theme_classic() +
+  theme(
+    axis.title.x = element_text(face = 'bold'),
+    plot.title = element_text(face = 'bold'),
+    plot.caption = element_text(color = "darkgray", hjust = 0)     
+  )
+```
+
+# 5. Summary of findings and recommendations
+
+Key findings:
+
+-   Of the four types of algorithms evaluated in Assignments 2 and 3, random forest had the best classification performance.
+
+    -   The random forest model with default parameters (RF1) had the highest accuracy (\~93%), recall (\~95%), and precision (\~92%).
+
+-   The decision tree models had the shortest computation time (approximately an order of magnitude less than random forest).
+
+    -   The pruned decision tree model (DT2) had \~76% accuracy, \~82% recall, and \~65% precision. It is also the most easily interpreted and visualized model.
+
+-   In general, baseline SVM and Adaboost models had modest classification performance that could be improved with hyperparameter tuning up to \~90% recall but at the cost of long computation time, which would make them impractical in a production environment.
+
+The main limitation of this analysis is that the number of model variations was very small. In practice, hyperparameter tuning would need to be performed more systematically (eg, grid search) to determine the optimal values.
+
+In conclusion, the SVM models did not change the recommendations from Assignment 2. Specifically, from a purely classification performance perspective (ie, for data science), the best model for bank term deposit classification is random forest. However, if interpretability and/or computation time are important (ie, business considerations), a decision tree model may be an acceptable alternative.
